@@ -1,0 +1,33 @@
+# ROS2 colcon build outputs
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 대용량 모델 바이너리 (별도 다운로드)
+*.onnx
+*.bin
+*.ncnn
+
+# ncnn 캐시
+.ncnn/
+
+# Claude Code
+.claude/
+src/.claude/
+
+# 에디터/OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ROS2 로그
+*.log
+rosout*
