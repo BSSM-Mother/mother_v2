@@ -59,20 +59,19 @@ class FollowerNode(Node):
         self.declare_parameter('distance_kd', 0.08)
 
         # Target bbox height ratio (fraction of image height)
-        self.declare_parameter('target_bbox_ratio', 0.45)
+        self.declare_parameter('target_bbox_ratio', 0.90)
 
         # Dead zone: don't move if error is small enough
         self.declare_parameter('angular_deadzone', 0.08)
-        self.declare_parameter('distance_deadzone', 0.15)
+        self.declare_parameter('distance_deadzone', 0.08)
 
         # Speed limits
         self.declare_parameter('max_speed', 180)
         self.declare_parameter('turn_speed', 70)
         self.declare_parameter('min_speed', 130)
 
-        # 후진은 bbox가 이 비율(image_height 대비) 초과할 때만 허용
-        # target_bbox_ratio=0.45 기준: 0.25 → bbox 70% 초과시만 후진
-        self.declare_parameter('backward_threshold', 0.45)
+        # 후진은 bbox가 target보다 이 비율 이상 초과할 때만 허용 (0.05 = 5% 초과시 후진)
+        self.declare_parameter('backward_threshold', 0.05)
 
         # Lost person timeout
         self.declare_parameter('lost_timeout', 1.5)
@@ -191,7 +190,10 @@ class FollowerNode(Node):
             side = 'RIGHT'
         else:
             side = 'LEFT'
-        self.get_logger().info(f'Object {side} (cx={cx:.2f}, ang_err={ang_error:.2f})')
+        self.get_logger().info(
+            f'Object {side} (cx={cx:.2f}, ang_err={ang_error:.2f}) | '
+            f'bbox_ratio={bbox_ratio:.2f}, dist_err={dist_error:.2f}'
+        )
 
         # Check dead zones
         in_angular_deadzone = abs(ang_error) < self.ang_deadzone

@@ -23,7 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_speed', default_value='150'),
         DeclareLaunchArgument('model_path', default_value=default_model),
         DeclareLaunchArgument('conf_threshold', default_value='0.35'),
-        DeclareLaunchArgument('target_bbox_ratio', default_value='0.25'),
+        DeclareLaunchArgument('target_bbox_ratio', default_value='0.90'),
         DeclareLaunchArgument('web_port', default_value='8080'),
         DeclareLaunchArgument('debug_class', default_value='-1'),
 
