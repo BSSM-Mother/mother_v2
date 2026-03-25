@@ -59,4 +59,15 @@ def generate_launch_description():
             }],
             output='screen',
         ),
+
+        Node(
+            package='motherv2_follower',
+            executable='follower_node',
+            name='follower_node',
+            parameters=[{
+                'image_width': LaunchConfiguration('camera_width'),
+                'image_height': LaunchConfiguration('camera_height'),
+            }],
+            output='screen',
+        ),
     ])

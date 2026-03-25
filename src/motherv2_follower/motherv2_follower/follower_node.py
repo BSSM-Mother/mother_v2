@@ -1,3 +1,4 @@
+import math
 import rclpy
 from rclpy.node import Node
 from motherv2_interfaces.msg import DetectionArray, MotorCommand
@@ -63,7 +64,7 @@ class FollowerNode(Node):
 
         # Dead zone: don't move if error is small enough
         self.declare_parameter('angular_deadzone', 0.08)
-        self.declare_parameter('distance_deadzone', 0.08)
+        self.declare_parameter('distance_deadzone', 0.05)
 
         # Speed limits
         self.declare_parameter('max_speed', 180)
@@ -71,7 +72,7 @@ class FollowerNode(Node):
         self.declare_parameter('min_speed', 130)
 
         # 후진은 bbox가 target보다 이 비율 이상 초과할 때만 허용 (0.05 = 5% 초과시 후진)
-        self.declare_parameter('backward_threshold', 0.05)
+        self.declare_parameter('backward_threshold', 0.03)
 
         # Lost person timeout
         self.declare_parameter('lost_timeout', 1.5)
@@ -232,10 +233,16 @@ class FollowerNode(Node):
             # Both: mix rotation and linear
             self._apply_mixed(angular_output, distance_output, cmd)
 
+    def _curve_speed(self, raw_output, max_speed):
+        """PID output [0, 255] → [min_speed, max_speed] with smoothstep S-curve.
+        양 끝은 완만하게, 중간 구간에서 가파르게 증가 (표준편차 CDF 느낌)."""
+        t = min(abs(raw_output) / 255.0, 1.0)
+        curved = 3 * t**2 - 2 * t**3  # smoothstep: slow → fast → slow
+        return int(self.min_speed + (max_speed - self.min_speed) * curved)
+
     def _apply_rotation(self, angular_output, cmd: MotorCommand):
         """Rotate in place: differential drive."""
-        speed = int(min(abs(angular_output) * self.turn_speed / 255.0 * 255, self.turn_speed))
-        speed = max(self.min_speed, speed)
+        speed = self._curve_speed(angular_output, self.turn_speed)
 
         if angular_output > 0:
             # Turn right: left wheel forward (1), right wheel backward (2)
@@ -254,8 +261,7 @@ class FollowerNode(Node):
 
     def _apply_linear(self, distance_output, cmd: MotorCommand):
         """Move forward or backward."""
-        speed = int(min(abs(distance_output) * self.max_speed / 255.0 * 255, self.max_speed))
-        speed = max(self.min_speed, speed)
+        speed = self._curve_speed(distance_output, self.max_speed)
 
         if distance_output > 0:
             # Too far → move forward
@@ -272,11 +278,12 @@ class FollowerNode(Node):
 
     def _apply_mixed(self, angular_output, distance_output, cmd: MotorCommand):
         """Combine rotation and linear motion: arc movement."""
-        base_speed = abs(distance_output) * self.max_speed
-        turn_factor = angular_output * self.turn_speed
+        base_speed = self._curve_speed(distance_output, self.max_speed)
+        turn_ratio = angular_output / 255.0  # -1.0 ~ 1.0
+        turn_delta = int(turn_ratio * self.turn_speed)
 
-        left_speed = base_speed + turn_factor
-        right_speed = base_speed - turn_factor
+        left_speed = base_speed + turn_delta
+        right_speed = base_speed - turn_delta
 
         # Determine direction based on distance
         if distance_output > 0:
@@ -298,9 +305,6 @@ class FollowerNode(Node):
         else:
             cmd.right_dir = 2 if base_dir == 1 else 1
             cmd.right_speed = int(min(abs(right_speed), self.max_speed))
-
-        cmd.left_speed = max(self.min_speed, cmd.left_speed)
-        cmd.right_speed = max(self.min_speed, cmd.right_speed)
 
     def _search_rotate(self, cmd: MotorCommand):
         """Rotate to search for lost person."""
