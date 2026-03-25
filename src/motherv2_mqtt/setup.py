@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'motherv2_web'
+package_name = 'motherv2_mqtt'
 
 setup(
     name=package_name,
@@ -14,8 +14,7 @@ setup(
     zip_safe=True,
     entry_points={
         'console_scripts': [
-            'web_node = motherv2_web.web_node:main',
-            'api_node = motherv2_web.api_node:main',
+            'mqtt_node = motherv2_mqtt.mqtt_node:main',
         ],
     },
 )

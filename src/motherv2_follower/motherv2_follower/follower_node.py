@@ -2,7 +2,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from motherv2_interfaces.msg import DetectionArray, MotorCommand, ObjectEstimateArray
-from std_msgs.msg import Float32
+from std_msgs.msg import Bool, Float32, String
 import time
 
 
@@ -75,6 +75,9 @@ class FollowerNode(Node):
         # 후진은 bbox가 target보다 이 비율 이상 초과할 때만 허용 (0.05 = 5% 초과시 후진)
         self.declare_parameter('backward_threshold', 0.03)
 
+        # API 없이 실행 시 초기부터 follow 활성화
+        self.declare_parameter('follow_default', True)
+
         # Lost person timeout
         self.declare_parameter('lost_timeout', 1.5)
 
@@ -130,10 +133,15 @@ class FollowerNode(Node):
 
         # ── 퍼블리셔 / 구독 ────────────────────────────────────────────────
         self.cmd_pub = self.create_publisher(MotorCommand, '/motherv2/cmd_motor', 1)
-
+        self.relay_pub = self.create_publisher(String, '/motherv2/relay_cmd', 1)
         self.sub = self.create_subscription(
             DetectionArray, '/motherv2/detections', self.detection_callback, 1
         )
+        self.follow_sub = self.create_subscription(
+            Bool, '/motherv2/follow_enabled', self._follow_enabled_callback, 1
+        )
+        follow_default = bool(self.get_parameter('follow_default').value)
+        self._follow_enabled = follow_default
 
         # SLAM 노드에서 오는 라이다 깊이 + 맵 좌표 추정값
         self.estimates_sub = self.create_subscription(
@@ -163,7 +171,32 @@ class FollowerNode(Node):
         # Control loop at 20Hz
         self.timer = self.create_timer(0.05, self.control_loop)
 
+        # LED pulse every 30s while following
+        self.declare_parameter('led_interval', 30.0)
+        self.declare_parameter('led_pulse_duration', 1.0)
+        self._led_interval = float(self.get_parameter('led_interval').value)
+        self._led_pulse_duration = float(self.get_parameter('led_pulse_duration').value)
+        self.led_timer = self.create_timer(self._led_interval, self._led_pulse)
+        self._led_off_timer = None
+
     # ── 콜백 ──────────────────────────────────────────────────────────────────
+
+    def _led_pulse(self):
+        if not self._follow_enabled:
+            return
+        on_msg = String()
+        on_msg.data = 'on'
+        self.relay_pub.publish(on_msg)
+        self.get_logger().info('LED pulse ON')
+        self._led_off_timer = self.create_timer(self._led_pulse_duration, self._led_off_once)
+
+    def _led_off_once(self):
+        off_msg = String()
+        off_msg.data = 'off'
+        self.relay_pub.publish(off_msg)
+        self.get_logger().info('LED pulse OFF')
+        self._led_off_timer.cancel()
+        self._led_off_timer = None
 
     def detection_callback(self, msg: DetectionArray):
         self._latest_detections = msg
@@ -174,6 +207,13 @@ class FollowerNode(Node):
     def _search_dir_callback(self, msg: Float32):
         self._search_direction = msg.data
         self._search_dir_time = time.time()
+
+    def _follow_enabled_callback(self, msg: Bool):
+        if self._follow_enabled != msg.data:
+            self._follow_enabled = msg.data
+            self.get_logger().info(
+                f'Follow mode: {"ON" if msg.data else "OFF"}'
+            )
 
     # ── 제어 루프 ─────────────────────────────────────────────────────────────
 
@@ -197,6 +237,11 @@ class FollowerNode(Node):
         return None
 
     def control_loop(self):
+        if not self._follow_enabled:
+            cmd = MotorCommand()
+            self._publish_cmd(cmd)
+            return
+
         msg = self._latest_detections
         self._latest_detections = None
 

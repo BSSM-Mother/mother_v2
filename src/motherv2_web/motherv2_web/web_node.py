@@ -16,6 +16,7 @@ from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 from motherv2_interfaces.msg import DetectionArray, MotorCommand, ObjectEstimateArray
+from std_msgs.msg import Bool
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -26,6 +27,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     frame_lock = threading.Lock()
     motor_state = {'left_speed': 0, 'left_dir': 0, 'right_speed': 0, 'right_dir': 0, 'state': 'STOP'}
     motor_lock = threading.Lock()
+    status_state = {'follow_enabled': True, 'detecting': False}
+    status_lock = threading.Lock()
 
     # SLAM 시각화용 공유 상태
     slam_map_jpeg = None       # 맵 이미지 JPEG bytes
@@ -43,6 +46,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self._snapshot()
         elif self.path == '/motor':
             self._motor_json()
+        elif self.path == '/state':
+            self._state_json()
         elif self.path == '/slam_map':
             self._slam_map()
         elif self.path == '/slam_state':
@@ -55,7 +60,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     def _index(self):
         html = _INDEX_HTML.encode()
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(html)))
         self.end_headers()
         self.wfile.write(html)
@@ -74,9 +79,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _motor_json(self):
+    def _state_json(self):
         with self.motor_lock:
             data = dict(self.motor_state)
+        with self.status_lock:
+            data.update(self.status_state)
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -183,6 +190,10 @@ class WebNode(Node):
             DetectionArray, '/motherv2/detections', self.detection_callback, 1)
         self.motor_sub = self.create_subscription(
             MotorCommand, '/motherv2/cmd_motor', self.motor_callback, 1)
+        # follow 상태 구독 → 웹 상태 표시용
+        self.follow_sub = self.create_subscription(
+            Bool, '/motherv2/follow_enabled', self.follow_callback, 1
+        )
 
         # ── 구독: SLAM ──────────────────────────────────────────────────────
         # /map 은 hector_mapping이 RELIABLE로 퍼블리시 (latch)
@@ -211,6 +222,10 @@ class WebNode(Node):
 
     # ── 기존 콜백 ─────────────────────────────────────────────────────────
 
+    def follow_callback(self, msg: Bool):
+        with MJPEGHandler.status_lock:
+            MJPEGHandler.status_state['follow_enabled'] = bool(msg.data)
+
     def detection_callback(self, msg: DetectionArray):
         boxes = []
         for det in msg.detections:
@@ -218,6 +233,8 @@ class WebNode(Node):
         with self._det_lock:
             self._det_boxes = boxes
             self._det_time = time.time()
+        with MJPEGHandler.status_lock:
+            MJPEGHandler.status_state['detecting'] = len(boxes) > 0
 
     def motor_callback(self, msg: MotorCommand):
         ls, ld = msg.left_speed, msg.left_dir
@@ -246,7 +263,12 @@ class WebNode(Node):
             frame = cv2.resize(frame, (self.stream_width, int(h * scale)))
 
         with self._det_lock:
-            boxes = self._det_boxes if (time.time() - self._det_time) < self._det_timeout else []
+            timed_out = (time.time() - self._det_time) >= self._det_timeout
+            boxes = [] if timed_out else self._det_boxes
+
+        if timed_out:
+            with MJPEGHandler.status_lock:
+                MJPEGHandler.status_state['detecting'] = False
 
         scale_x = frame.shape[1] / w if w > self.stream_width else 1.0
         scale_y = frame.shape[0] / h if w > self.stream_width else 1.0
