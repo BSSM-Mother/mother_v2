@@ -1,0 +1,164 @@
+"""
+slam.launch.py
+──────────────────────────────────────────────────────────────────────────────
+Hector SLAM + 객체 위치 추정 노드 런치 파일
+
+시작 노드:
+  1) hector_mapping   — /scan → map TF + /slam_out_pose 퍼블리시
+  2) slam_localization_node — 라이다 깊이 융합 + 궤적 예측 + 장소 인덱싱
+
+사용법:
+  # SLAM만 단독 실행 (다른 노드와 결합)
+  ros2 launch motherv2_bringup slam.launch.py
+
+  # 파라미터 오버라이드 예시
+  ros2 launch motherv2_bringup slam.launch.py \
+      lidar_frame:=laser \
+      camera_hfov_deg:=62.2 \
+      target_depth_m:=0.8
+
+필수 조건:
+  - /scan 토픽이 퍼블리시되어야 함 (라이다 드라이버 별도 실행)
+  - hector_slam ROS2 패키지 설치 필요:
+      sudo apt install ros-jazzy-hector-slam
+      (또는 소스 빌드: https://github.com/tu-darmstadt-ros-pkg/hector_slam)
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        # ── 런치 인자 ──────────────────────────────────────────────────────
+        # LiDAR 설정
+        DeclareLaunchArgument(
+            'lidar_frame', default_value='base_scan',
+            description='LiDAR TF 프레임 ID (/scan header.frame_id)'),
+        DeclareLaunchArgument(
+            'base_frame', default_value='base_link',
+            description='로봇 기준 프레임'),
+        DeclareLaunchArgument(
+            'odom_frame', default_value='odom',
+            description='Odometry 프레임 (odometry 없을 경우 base_link와 동일하게 설정)'),
+        DeclareLaunchArgument(
+            'map_frame', default_value='map',
+            description='맵 프레임'),
+
+        # hector_mapping 맵 설정
+        DeclareLaunchArgument(
+            'map_resolution', default_value='0.05',
+            description='맵 해상도 (미터/셀)'),
+        DeclareLaunchArgument(
+            'map_size', default_value='2048',
+            description='맵 크기 (셀 수, N×N)'),
+        DeclareLaunchArgument(
+            'map_update_throttle', default_value='0.4',
+            description='맵 업데이트 최소 주기 (초)'),
+
+        # 카메라 / 라이다 융합 파라미터
+        DeclareLaunchArgument(
+            'camera_hfov_deg', default_value='62.2',
+            description='카메라 수평 화각 (도). IMX219=62.2°'),
+        DeclareLaunchArgument(
+            'image_width', default_value='640',
+            description='카메라 이미지 가로 해상도'),
+        DeclareLaunchArgument(
+            'lidar_angle_offset_rad', default_value='0.0',
+            description='카메라-라이다 수평 각도 오프셋 (라디안)'),
+        DeclareLaunchArgument(
+            'target_depth_m', default_value='0.8',
+            description='라이다 기반 목표 추적 거리 (미터)'),
+        DeclareLaunchArgument(
+            'target_class_id', default_value='39',
+            description='추적 대상 COCO class_id (기본값 39=bottle)'),
+        DeclareLaunchArgument(
+            'lost_timeout_s', default_value='1.5',
+            description='객체 로스트 판정 시간 (초)'),
+        DeclareLaunchArgument(
+            'prediction_horizon_s', default_value='2.0',
+            description='Dead-reckoning 예측 시간 (초)'),
+        DeclareLaunchArgument(
+            'location_index_path',
+            default_value='/root/.ros/motherv2/location_index.json',
+            description='장소 인덱스 JSON 저장 경로'),
+
+        # ── hector_mapping 노드 ────────────────────────────────────────────
+        # /scan → map TF, /slam_out_pose, /map 퍼블리시
+        Node(
+            package='hector_mapping',
+            executable='hector_mapping',
+            name='hector_mapping',
+            output='screen',
+            parameters=[{
+                # 프레임 설정
+                'base_frame': LaunchConfiguration('base_frame'),
+                'odom_frame': LaunchConfiguration('odom_frame'),
+                'map_frame': LaunchConfiguration('map_frame'),
+
+                # 맵 설정
+                'map_resolution': LaunchConfiguration('map_resolution'),
+                'map_size': LaunchConfiguration('map_size'),
+                'map_update_distance_thresh': 0.4,
+                'map_update_angle_thresh': 0.06,   # ~3.4°
+                'map_pub_period': 2.0,
+
+                # 스캔 매칭 품질
+                'laser_min_dist': 0.1,
+                'laser_max_dist': 8.0,
+                'laser_z_min_value': -1.0,
+                'laser_z_max_value': 2.0,
+
+                # TF 퍼블리시
+                'pub_map_odom_transform': True,
+                'pub_map_scanmatch_transform': True,
+
+                # 로봇에 오도메트리가 없을 때: odom_frame = base_frame 으로 설정하고
+                # use_tf_scan_transformation = false 로 설정해야 함
+                'use_tf_scan_transformation': True,
+                'use_tf_pose_start_estimate': False,
+
+                # 스캔 매칭 파라미터
+                'map_multi_res_levels': 3,
+                'update_factor_free': 0.4,
+                'update_factor_occupied': 0.9,
+                'occupied_threshold': 0.7,
+                'free_threshold': 0.3,
+            }],
+            remappings=[
+                ('scan', '/scan'),
+            ],
+        ),
+
+        # ── slam_localization_node ─────────────────────────────────────────
+        # LiDAR 깊이 융합 + 맵 좌표 변환 + 궤적 예측 + 장소 인덱싱
+        Node(
+            package='motherv2_slam',
+            executable='slam_localization_node',
+            name='slam_localization_node',
+            output='screen',
+            parameters=[{
+                'camera_hfov_deg': LaunchConfiguration('camera_hfov_deg'),
+                'image_width': LaunchConfiguration('image_width'),
+                'lidar_angle_offset_rad':
+                    LaunchConfiguration('lidar_angle_offset_rad'),
+                'target_class_id': LaunchConfiguration('target_class_id'),
+                'lost_timeout_s': LaunchConfiguration('lost_timeout_s'),
+                'prediction_horizon_s':
+                    LaunchConfiguration('prediction_horizon_s'),
+                'map_frame': LaunchConfiguration('map_frame'),
+                'base_frame': LaunchConfiguration('base_frame'),
+                'location_index_path':
+                    LaunchConfiguration('location_index_path'),
+                'depth_percentile': 15,
+                'min_depth_m': 0.15,
+                'max_depth_m': 8.0,
+                'ema_alpha': 0.4,
+                'sector_padding_rad': 0.05,
+                'index_save_interval_s': 10.0,
+                'index_cluster_radius_m': 0.5,
+            }],
+        ),
+    ])

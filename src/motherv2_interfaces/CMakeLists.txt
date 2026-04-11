@@ -9,6 +9,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Detection.msg"
   "msg/DetectionArray.msg"
   "msg/MotorCommand.msg"
+  "msg/ObjectEstimate.msg"
+  "msg/ObjectEstimateArray.msg"
   DEPENDENCIES std_msgs
 )
 

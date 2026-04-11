@@ -1,7 +1,8 @@
 import math
 import rclpy
 from rclpy.node import Node
-from motherv2_interfaces.msg import DetectionArray, MotorCommand
+from motherv2_interfaces.msg import DetectionArray, MotorCommand, ObjectEstimateArray
+from std_msgs.msg import Float32
 import time
 
 
@@ -59,7 +60,7 @@ class FollowerNode(Node):
         self.declare_parameter('distance_ki', 0.005)
         self.declare_parameter('distance_kd', 0.08)
 
-        # Target bbox height ratio (fraction of image height)
+        # Target bbox height ratio (fraction of image height) — SLAM 없을 때 사용
         self.declare_parameter('target_bbox_ratio', 0.90)
 
         # Dead zone: don't move if error is small enough
@@ -81,6 +82,18 @@ class FollowerNode(Node):
         self.declare_parameter('search_speed', 110)
         self.declare_parameter('search_enabled', False)
 
+        # ── SLAM 연동 파라미터 ─────────────────────────────────────────────
+        # True 이면 /motherv2/object_estimates 의 라이다 깊이로 거리 제어
+        self.declare_parameter('use_slam_depth', True)
+        # 라이다 깊이 기반 목표 거리 (미터)
+        self.declare_parameter('target_depth_m', 0.8)
+        # 라이다 깊이 deadzone (미터)
+        self.declare_parameter('depth_deadzone_m', 0.05)
+        # 라이다 깊이 backward_threshold (미터)
+        self.declare_parameter('depth_backward_threshold_m', 0.03)
+        # 로스트 상태에서 search_direction 사용 여부
+        self.declare_parameter('use_slam_search', True)
+
         self.img_w = int(self.get_parameter('image_width').value)
         self.img_h = int(self.get_parameter('image_height').value)
         self.target_ratio = float(self.get_parameter('target_bbox_ratio').value)
@@ -93,6 +106,13 @@ class FollowerNode(Node):
         self.lost_timeout = float(self.get_parameter('lost_timeout').value)
         self.search_speed = int(self.get_parameter('search_speed').value)
         self.search_enabled = bool(self.get_parameter('search_enabled').value)
+
+        self.use_slam_depth = bool(self.get_parameter('use_slam_depth').value)
+        self.target_depth_m = float(self.get_parameter('target_depth_m').value)
+        self.depth_deadzone_m = float(self.get_parameter('depth_deadzone_m').value)
+        self.depth_backward_thresh = float(
+            self.get_parameter('depth_backward_threshold_m').value)
+        self.use_slam_search = bool(self.get_parameter('use_slam_search').value)
 
         # PID controllers
         self.angular_pid = PIDController(
@@ -108,21 +128,54 @@ class FollowerNode(Node):
             -255.0, 255.0
         )
 
+        # ── 퍼블리셔 / 구독 ────────────────────────────────────────────────
         self.cmd_pub = self.create_publisher(MotorCommand, '/motherv2/cmd_motor', 1)
+
         self.sub = self.create_subscription(
             DetectionArray, '/motherv2/detections', self.detection_callback, 1
         )
 
+        # SLAM 노드에서 오는 라이다 깊이 + 맵 좌표 추정값
+        self.estimates_sub = self.create_subscription(
+            ObjectEstimateArray, '/motherv2/object_estimates',
+            self._estimates_callback, 1,
+        )
+
+        # SLAM 노드에서 오는 복구 탐색 방향 (로봇 기준 라디안)
+        self.search_dir_sub = self.create_subscription(
+            Float32, '/motherv2/search_direction',
+            self._search_dir_callback, 1,
+        )
+
+        # ── 상태 변수 ──────────────────────────────────────────────────────
         self.last_person_time = 0.0
         self.last_person_x = 0.5  # last known direction (for search rotation)
 
+        # SLAM 데이터
+        self._latest_detections = None
+        self._latest_estimates: ObjectEstimateArray | None = None
+        # SLAM 로스트 시 탐색 방향 (라디안, None = SLAM 미사용)
+        self._search_direction: float | None = None
+        self._search_dir_time: float = 0.0
+
+        self._last_cmd_was_stop = False
+
         # Control loop at 20Hz
         self.timer = self.create_timer(0.05, self.control_loop)
-        self._latest_detections = None
-        self._last_cmd_was_stop = False
+
+    # ── 콜백 ──────────────────────────────────────────────────────────────────
 
     def detection_callback(self, msg: DetectionArray):
         self._latest_detections = msg
+
+    def _estimates_callback(self, msg: ObjectEstimateArray):
+        self._latest_estimates = msg
+
+    def _search_dir_callback(self, msg: Float32):
+        self._search_direction = msg.data
+        self._search_dir_time = time.time()
+
+    # ── 제어 루프 ─────────────────────────────────────────────────────────────
 
     def _select_person(self, detections):
         """Select the largest (closest) bottle detection."""
@@ -133,6 +186,15 @@ class FollowerNode(Node):
         if not persons:
             return None
         return max(persons, key=lambda d: d.w * d.h)
+
+    def _find_estimate(self, class_id: int):
+        """ObjectEstimateArray에서 class_id 매칭 추정값 반환."""
+        if self._latest_estimates is None:
+            return None
+        for est in self._latest_estimates.estimates:
+            if est.class_id == class_id:
+                return est
+        return None
 
     def control_loop(self):
         msg = self._latest_detections
@@ -145,16 +207,34 @@ class FollowerNode(Node):
             person = self._select_person(msg.detections)
             if person is not None:
                 self.last_person_time = now
-                self._follow_person(person, cmd)
+                # SLAM 추정값 조회 (있으면 깊이 기반 거리 제어)
+                estimate = self._find_estimate(person.class_id)
+                self._follow_person(person, cmd, estimate)
                 self._publish_cmd(cmd)
                 return
 
         # No person detected
         elapsed = now - self.last_person_time if self.last_person_time > 0 else 999.0
 
-        if elapsed > self.lost_timeout and self.search_enabled:
-            # Search: rotate toward last known direction
-            self._search_rotate(cmd)
+        if elapsed > self.lost_timeout:
+            # SLAM 탐색 방향 유효 여부 확인 (2초 이내 수신)
+            slam_search_valid = (
+                self.use_slam_search
+                and self._search_direction is not None
+                and (now - self._search_dir_time) < 2.0
+            )
+
+            if slam_search_valid:
+                # SLAM이 알려준 방향으로 회전 (사용자가 마지막으로 사라진 방향)
+                self._slam_search_rotate(self._search_direction, cmd)
+            elif self.search_enabled:
+                # Fallback: 마지막 알려진 x 방향으로 회전
+                self._search_rotate(cmd)
+            else:
+                cmd.left_speed = 0
+                cmd.right_speed = 0
+                cmd.left_dir = 0
+                cmd.right_dir = 0
         else:
             # Brief loss: stop and wait
             cmd.left_speed = 0
@@ -172,16 +252,39 @@ class FollowerNode(Node):
         self._last_cmd_was_stop = is_stop
         self.cmd_pub.publish(cmd)
 
-    def _follow_person(self, person, cmd: MotorCommand):
+    def _follow_person(self, person, cmd: MotorCommand, estimate=None):
         # Calculate person center x as fraction of image width (0 = left, 1 = right)
         cx = (person.x + person.w / 2.0) / self.img_w
         # Angular error: positive = person is to the right, need to turn right
         ang_error = cx - 0.5
 
-        # Distance: bbox height as fraction of image height
-        bbox_ratio = person.h / self.img_h
-        # Distance error: positive = too far (bbox too small), negative = too close
-        dist_error = self.target_ratio - bbox_ratio
+        # ── 거리 오차 계산 ────────────────────────────────────────────────
+        # SLAM 라이다 깊이 사용 가능 여부 판단
+        use_depth = (
+            self.use_slam_depth
+            and estimate is not None
+            and estimate.depth_valid
+            and estimate.depth > 0.0
+        )
+
+        if use_depth:
+            # 실제 거리 기반 오차 (미터 단위)
+            depth_err_abs = estimate.depth - self.target_depth_m
+            # PID 입력 정규화 (÷ target_depth 로 무차원화)
+            dist_error = depth_err_abs / self.target_depth_m
+            dist_deadzone = self.depth_deadzone_m / self.target_depth_m
+            dist_backward_thresh = self.depth_backward_thresh / self.target_depth_m
+            self.get_logger().info(
+                f'[SLAM] depth={estimate.depth:.2f}m '
+                f'target={self.target_depth_m:.2f}m '
+                f'err={depth_err_abs:.3f}m'
+            )
+        else:
+            # bbox 높이 비율 기반 오차 (SLAM 없을 때 fallback)
+            bbox_ratio = person.h / self.img_h
+            dist_error = self.target_ratio - bbox_ratio
+            dist_deadzone = self.dist_deadzone
+            dist_backward_thresh = self.backward_threshold
 
         self.last_person_x = cx
 
@@ -193,15 +296,14 @@ class FollowerNode(Node):
             side = 'LEFT'
         self.get_logger().info(
             f'Object {side} (cx={cx:.2f}, ang_err={ang_error:.2f}) | '
-            f'bbox_ratio={bbox_ratio:.2f}, dist_err={dist_error:.2f}'
+            f'dist_err={dist_error:.3f}'
         )
 
         # Check dead zones
         in_angular_deadzone = abs(ang_error) < self.ang_deadzone
-        in_distance_deadzone = abs(dist_error) < self.dist_deadzone
+        in_distance_deadzone = abs(dist_error) < dist_deadzone
 
         if in_angular_deadzone and in_distance_deadzone:
-            # Person is centered and at right distance → stop
             cmd.left_speed = 0
             cmd.right_speed = 0
             cmd.left_dir = 0
@@ -214,30 +316,25 @@ class FollowerNode(Node):
         angular_output = self.angular_pid.compute(ang_error)
         distance_output = self.distance_pid.compute(dist_error)
 
-        # If angular error is large, rotation only (don't lurch forward while object is at edge)
+        # If angular error is large, rotation only
         if abs(ang_error) > 0.25:
             in_distance_deadzone = True
 
-        # bbox가 backward_threshold 이내로만 가까우면 후진 안 함 (deadzone 처리)
-        # dist_error < 0 이고 abs(dist_error) < backward_threshold → 그냥 멈춤
-        if dist_error < 0 and abs(dist_error) < self.backward_threshold:
+        # backward threshold 처리
+        if dist_error < 0 and abs(dist_error) < dist_backward_thresh:
             in_distance_deadzone = True
 
         if not in_angular_deadzone and in_distance_deadzone:
-            # Priority: rotate toward person (no forward/backward)
             self._apply_rotation(angular_output, cmd)
         elif in_angular_deadzone and not in_distance_deadzone:
-            # Move forward to adjust distance
             self._apply_linear(distance_output, cmd)
         else:
-            # Both: mix rotation and linear
             self._apply_mixed(angular_output, distance_output, cmd)
 
     def _curve_speed(self, raw_output, max_speed):
-        """PID output [0, 255] → [min_speed, max_speed] with smoothstep S-curve.
-        양 끝은 완만하게, 중간 구간에서 가파르게 증가 (표준편차 CDF 느낌)."""
+        """PID output [0, 255] → [min_speed, max_speed] with smoothstep S-curve."""
         t = min(abs(raw_output) / 255.0, 1.0)
-        curved = 3 * t**2 - 2 * t**3  # smoothstep: slow → fast → slow
+        curved = 3 * t**2 - 2 * t**3
         return int(self.min_speed + (max_speed - self.min_speed) * curved)
 
     def _apply_rotation(self, angular_output, cmd: MotorCommand):
@@ -245,14 +342,12 @@ class FollowerNode(Node):
         speed = self._curve_speed(angular_output, self.turn_speed)
 
         if angular_output > 0:
-            # Turn right: left wheel forward (1), right wheel backward (2)
             cmd.left_speed = speed
             cmd.right_speed = speed
             cmd.left_dir = 1
             cmd.right_dir = 2
             self.get_logger().info(f'Rotate RIGHT (angular={angular_output:.2f}, speed={speed})')
         else:
-            # Turn left: left wheel backward (2), right wheel forward (1)
             cmd.left_speed = speed
             cmd.right_speed = speed
             cmd.left_dir = 2
@@ -264,13 +359,11 @@ class FollowerNode(Node):
         speed = self._curve_speed(distance_output, self.max_speed)
 
         if distance_output > 0:
-            # Too far → move forward
             cmd.left_speed = speed
             cmd.right_speed = speed
             cmd.left_dir = 1
             cmd.right_dir = 1
         else:
-            # Too close → move backward
             cmd.left_speed = speed
             cmd.right_speed = speed
             cmd.left_dir = 2
@@ -279,19 +372,17 @@ class FollowerNode(Node):
     def _apply_mixed(self, angular_output, distance_output, cmd: MotorCommand):
         """Combine rotation and linear motion: arc movement."""
         base_speed = self._curve_speed(distance_output, self.max_speed)
-        turn_ratio = angular_output / 255.0  # -1.0 ~ 1.0
+        turn_ratio = angular_output / 255.0
         turn_delta = int(turn_ratio * self.turn_speed)
 
         left_speed = base_speed + turn_delta
         right_speed = base_speed - turn_delta
 
-        # Determine direction based on distance
         if distance_output > 0:
-            base_dir = 1  # forward
+            base_dir = 1
         else:
-            base_dir = 2  # backward
+            base_dir = 2
 
-        # Handle speed sign (if a wheel speed goes negative, reverse its direction)
         if left_speed >= 0:
             cmd.left_dir = base_dir
             cmd.left_speed = int(min(abs(left_speed), self.max_speed))
@@ -306,16 +397,47 @@ class FollowerNode(Node):
             cmd.right_dir = 2 if base_dir == 1 else 1
             cmd.right_speed = int(min(abs(right_speed), self.max_speed))
 
+    def _slam_search_rotate(self, search_angle: float, cmd: MotorCommand):
+        """
+        SLAM 예측 방향(search_angle)으로 회전.
+        search_angle: 로봇 기준 라디안 (양수=좌, 음수=우, ROS 관례)
+        deadzone 이내면 직진 탐색.
+        """
+        SEARCH_DEADZONE = 0.15  # 라디안 (~8.6°)
+
+        if abs(search_angle) < SEARCH_DEADZONE:
+            # 예측 방향이 정면 — 직진
+            cmd.left_speed = self.search_speed
+            cmd.right_speed = self.search_speed
+            cmd.left_dir = 1
+            cmd.right_dir = 1
+            self.get_logger().info(
+                f'[SLAM SEARCH] 직진 탐색 (angle={math.degrees(search_angle):.1f}°)')
+        elif search_angle > 0:
+            # 왼쪽으로 회전
+            cmd.left_speed = self.search_speed
+            cmd.right_speed = self.search_speed
+            cmd.left_dir = 2
+            cmd.right_dir = 1
+            self.get_logger().info(
+                f'[SLAM SEARCH] 좌회전 (angle={math.degrees(search_angle):.1f}°)')
+        else:
+            # 오른쪽으로 회전
+            cmd.left_speed = self.search_speed
+            cmd.right_speed = self.search_speed
+            cmd.left_dir = 1
+            cmd.right_dir = 2
+            self.get_logger().info(
+                f'[SLAM SEARCH] 우회전 (angle={math.degrees(search_angle):.1f}°)')
+
     def _search_rotate(self, cmd: MotorCommand):
-        """Rotate to search for lost person."""
+        """Rotate to search for lost person (SLAM 미사용 fallback)."""
         if self.last_person_x >= 0.5:
-            # Last seen on right → rotate right
             cmd.left_speed = self.search_speed
             cmd.right_speed = self.search_speed
             cmd.left_dir = 1
             cmd.right_dir = 2
         else:
-            # Last seen on left → rotate left
             cmd.left_speed = self.search_speed
             cmd.right_speed = self.search_speed
             cmd.left_dir = 2
