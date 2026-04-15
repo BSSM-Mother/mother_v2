@@ -441,11 +441,22 @@ class SlamLocalizationNode(Node):
 
     def _lidar_only_estimate(self):
         """
-        마지막 알려진 맵 위치 방향 ±30° LiDAR 스캔으로 대상 탐색.
+        궤적 예측 위치 방향으로 LiDAR 스캔하여 객체 추적.
+
+        거리 비교 대신 방향 기반 추적:
+          - 궤적으로 예측한 맵 좌표 → 로봇 기준 방위각 계산
+          - 경과 시간에 비례해 스캔 섹터 확대 (불확실성 반영)
+          - 해당 방향에서 유효한 LiDAR 값이 있으면 그게 객체
+          - 거리 비교 없음 → 객체가 이동해도 계속 추적 가능
+
         Returns (depth, map_x, map_y, angle) or None.
         """
         scan = self._latest_scan
         if scan is None:
+            return None
+
+        traj = self._trajectory.get(self.target_class)
+        if traj is None or not traj.has_data:
             return None
 
         try:
@@ -463,31 +474,34 @@ class SlamLocalizationNode(Node):
         rqw = robot_tf.transform.rotation.w
         robot_yaw = 2.0 * math.atan2(rqz, rqw)
 
-        # 마지막 맵 위치 → 로봇 기준 방위각
-        dx = self._last_known_map_x - rx
-        dy = self._last_known_map_y - ry
-        expected_dist = math.hypot(dx, dy)
+        # 로스트 경과 시간으로 예측 위치 계산
+        elapsed = time.time() - self._last_detection_time
+        pred_x, pred_y = traj.predict(elapsed)
+        if pred_x is None:
+            pred_x, pred_y = traj.last_position()
+        if pred_x is None:
+            return None
+
+        # 예측 위치 → 로봇 기준 방위각
+        dx = pred_x - rx
+        dy = pred_y - ry
         world_angle = math.atan2(dy, dx)
         search_angle = world_angle - robot_yaw
         search_angle = math.atan2(math.sin(search_angle), math.cos(search_angle))
 
-        # ±30° 섹터 LiDAR 측정
-        raw_depth = self._measure_depth(search_angle, math.radians(30))
+        # 경과 시간이 길수록 섹터 확대 (초당 5°, 최대 ±60°)
+        sector = min(math.radians(60), math.radians(20) + elapsed * math.radians(5))
+
+        raw_depth = self._measure_depth(search_angle, sector)
         if raw_depth <= 0.0:
             self.get_logger().debug(
-                f'[LiDAR] 방향({math.degrees(search_angle):.0f}°) 스캔 없음'
-            )
-            return None
-
-        # 예상 거리 대비 1.5m 초과 차이 → 다른 장애물
-        if abs(raw_depth - expected_dist) > 1.5:
-            self.get_logger().debug(
-                f'[LiDAR] 거리 불일치: 측정={raw_depth:.2f}m 예상={expected_dist:.2f}m'
+                f'[LiDAR] 방향({math.degrees(search_angle):.0f}°) ±{math.degrees(sector):.0f}° 스캔 없음'
             )
             return None
 
         self.get_logger().info(
-            f'[LiDAR] 추적 성공: {raw_depth:.2f}m @ {math.degrees(search_angle):.0f}°'
+            f'[LiDAR] 추적: {raw_depth:.2f}m @ {math.degrees(search_angle):.0f}° '
+            f'(±{math.degrees(sector):.0f}°, elapsed={elapsed:.1f}s)'
         )
 
         map_x, map_y = self._depth_to_map(raw_depth, search_angle)
