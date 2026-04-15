@@ -131,6 +131,15 @@ def generate_launch_description():
             ),
         ]),
 
+        # ── explore_node ───────────────────────────────────────────────────
+        # Frontier 기반 자율 맵핑 (slam_mode="explore" 수신 시 활성화)
+        Node(
+            package='motherv2_slam',
+            executable='explore_node',
+            name='explore_node',
+            output='screen',
+        ),
+
         # ── slam_localization_node ─────────────────────────────────────────
         # LiDAR 깊이 융합 + 맵 좌표 변환 + 궤적 예측 + 장소 인덱싱
         Node(

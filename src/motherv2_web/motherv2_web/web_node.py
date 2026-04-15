@@ -316,8 +316,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except Exception:
             self._json_response({'ok': False, 'error': 'bad json'}, 400)
             return
-        if mode not in ('mapping', 'tracking'):
-            self._json_response({'ok': False, 'error': 'mode must be mapping or tracking'}, 400)
+        if mode not in ('mapping', 'tracking', 'explore'):
+            self._json_response({'ok': False, 'error': 'mode must be mapping, tracking, or explore'}, 400)
             return
         with self.__class__._node_ref_lock:
             node = self.__class__._node_ref
@@ -831,8 +831,9 @@ canvas{display:block;margin:0 auto;border-radius:6px}
 </div>
 <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;justify-content:center">
   <span id="mode-badge" style="font-size:.7em;padding:3px 10px;border-radius:12px;background:#1e3a1e;color:#0f0;border:1px solid #2a5a2a">MAPPING</span>
-  <button onclick="setMode('tracking')" id="btn-tracking" style="background:#1a2a3a;border:1px solid #2a4a6a;color:#4af;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">🔍 추적 모드</button>
-  <button onclick="setMode('mapping')" id="btn-mapping" style="background:#1e3a1e;border:1px solid #2a5a2a;color:#0f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">🗺 매핑 모드</button>
+  <button onclick="setMode('tracking')" id="btn-tracking" style="background:#1a2a3a;border:1px solid #2a4a6a;color:#4af;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">추적 모드</button>
+  <button onclick="setMode('mapping')" id="btn-mapping" style="background:#1e3a1e;border:1px solid #2a5a2a;color:#0f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">매핑 모드</button>
+  <button onclick="setMode('explore')" id="btn-explore" style="background:#2a1a3a;border:1px solid #5a2a8a;color:#c8f;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">자동 탐색</button>
 </div>
 <div id="place-list"></div>
 </div>
@@ -1227,6 +1228,9 @@ function setMode(mode){
         if(mode==="tracking"){
           badge.textContent="TRACKING";
           badge.style.background="#1a2a3a";badge.style.color="#4af";badge.style.borderColor="#2a4a6a";
+        } else if(mode==="explore"){
+          badge.textContent="EXPLORE";
+          badge.style.background="#2a1a3a";badge.style.color="#c8f";badge.style.borderColor="#5a2a8a";
         } else {
           badge.textContent="MAPPING";
           badge.style.background="#1e3a1e";badge.style.color="#0f0";badge.style.borderColor="#2a5a2a";

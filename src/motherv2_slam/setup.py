@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'slam_localization_node = motherv2_slam.slam_localization_node:main',
+            'explore_node = motherv2_slam.explore_node:main',
         ],
     },
 )
