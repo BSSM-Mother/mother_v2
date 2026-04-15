@@ -47,7 +47,7 @@ class DetectionNode(Node):
         self.stream_width = int(self.get_parameter('stream_width').value)
         self.detection_interval = float(self.get_parameter('detection_interval').value)
 
-        self.target_names = {'bottle'}
+        self.target_names = {'person'}
         if self.debug_class >= 0 and self.debug_class < len(COCO_NAMES):
             debug_name = COCO_NAMES[self.debug_class]
             self.target_names.add(debug_name)

@@ -269,6 +269,14 @@ class SlamLocalizationNode(Node):
         # class_id → TrajectoryTracker
         self._trajectory: dict[int, TrajectoryTracker] = {}
 
+        # ── 3단계 추적 상태 ────────────────────────────────────────────────
+        # 카메라 → LiDAR 전용 → 마지막 위치 기억
+        self._last_known_map_x: float | None = None
+        self._last_known_map_y: float | None = None
+        self._last_known_depth: float | None = None
+        self._last_known_angle: float | None = None
+        self._last_known_pub_time: float = 0.0  # last_known 퍼블리시 rate limit
+
         # ── 장소 인덱스 ────────────────────────────────────────────────────
         idx_path = self.get_parameter('location_index_path').value
         cluster_r = float(
@@ -339,12 +347,19 @@ class SlamLocalizationNode(Node):
 
             if det.class_id == self.target_class:
                 detected_target = True
+                # 카메라 bbox로 방위각은 항상 갱신
+                self._last_known_angle = est.angle
                 if est.map_valid:
                     # 궤적 업데이트
                     traj = self._get_trajectory(det.class_id)
                     traj.update(est.map_x, est.map_y)
                     # 장소 인덱싱
                     self._loc_index.add(det.class_id, est.map_x, est.map_y)
+                    # 마지막 위치 기억 (3단계 추적용)
+                    self._last_known_map_x = est.map_x
+                    self._last_known_map_y = est.map_y
+                    if est.depth_valid:
+                        self._last_known_depth = est.depth
 
         if detected_target:
             self._last_detection_time = time.time()
@@ -360,22 +375,45 @@ class SlamLocalizationNode(Node):
 
     def _lost_check_loop(self):
         """
-        대상이 lost_timeout 이상 감지 안 되면:
-          - 로스트 상태로 전환
-          - 궤적 기반 dead-reckoning 예측 위치 퍼블리시
+        3단계 추적:
+          1) 카메라 감지 중  → _detections_callback이 담당 (여기서 아무것도 안 함)
+          2) 카메라 lost     → LiDAR 전용으로 마지막 방향 탐색
+          3) LiDAR도 실패   → 마지막 알려진 위치를 estimate로 유지
         """
         elapsed = time.time() - self._last_detection_time
         if elapsed < self.lost_timeout:
-            return  # 아직 로스트 아님
+            return  # 카메라 추적 중
 
+        # ── 카메라 신호 없음 ──────────────────────────────────────────────
         if not self._is_lost:
             self._is_lost = True
             self.get_logger().info(
-                f'[LOST] 대상(class={self.target_class}) '
-                f'감지 없음 {elapsed:.1f}s → 예측 위치로 복구 탐색 시작'
+                f'[LOST] class={self.target_class} 카메라 없음 ({elapsed:.1f}s) '
+                f'→ LiDAR 전용 추적 시도'
             )
 
-        # 예측 위치 퍼블리시
+        # ── 2단계: LiDAR 전용 추적 ───────────────────────────────────────
+        if self._last_known_map_x is not None:
+            result = self._lidar_only_estimate()
+            if result is not None:
+                depth, map_x, map_y, angle = result
+                self._publish_lidar_estimate(depth, map_x, map_y, angle)
+                return  # LiDAR 추적 성공 → prediction 불필요
+        else:
+            # _last_known이 없으면 카메라가 한 번도 물체를 못 본 것
+            return
+
+        # ── 3단계: 마지막 위치 유지 ──────────────────────────────────────
+        now = time.time()
+        if now - self._last_known_pub_time >= 1.0:   # 1Hz로 rate-limit
+            self.get_logger().info(
+                f'[LAST_KNOWN] ({self._last_known_map_x:.2f}, {self._last_known_map_y:.2f}) '
+                f'유지 중 (elapsed={elapsed:.1f}s)'
+            )
+            self._publish_last_known_estimate()
+            self._last_known_pub_time = now
+
+        # 예측 위치 퍼블리시 (follower_node 복구 탐색용)
         traj = self._trajectory.get(self.target_class)
         if traj is None or not traj.has_data:
             return
@@ -384,7 +422,6 @@ class SlamLocalizationNode(Node):
         if px is None:
             return
 
-        # 1) 맵 프레임 예측 위치 퍼블리시
         pose = PoseStamped()
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.header.frame_id = self.map_frame
@@ -394,12 +431,129 @@ class SlamLocalizationNode(Node):
         pose.pose.orientation.w = 1.0
         self.prediction_pub.publish(pose)
 
-        # 2) 로봇 기준 탐색 각도 퍼블리시 (follower_node용)
         search_angle = self._compute_search_angle(px, py)
         if search_angle is not None:
             msg_f32 = self._Float32()
             msg_f32.data = search_angle
             self.search_dir_pub.publish(msg_f32)
+
+    # ── LiDAR 전용 추적 ───────────────────────────────────────────────────
+
+    def _lidar_only_estimate(self):
+        """
+        마지막 알려진 맵 위치 방향 ±30° LiDAR 스캔으로 대상 탐색.
+        Returns (depth, map_x, map_y, angle) or None.
+        """
+        scan = self._latest_scan
+        if scan is None:
+            return None
+
+        try:
+            robot_tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.05),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+        rx = robot_tf.transform.translation.x
+        ry = robot_tf.transform.translation.y
+        rqz = robot_tf.transform.rotation.z
+        rqw = robot_tf.transform.rotation.w
+        robot_yaw = 2.0 * math.atan2(rqz, rqw)
+
+        # 마지막 맵 위치 → 로봇 기준 방위각
+        dx = self._last_known_map_x - rx
+        dy = self._last_known_map_y - ry
+        expected_dist = math.hypot(dx, dy)
+        world_angle = math.atan2(dy, dx)
+        search_angle = world_angle - robot_yaw
+        search_angle = math.atan2(math.sin(search_angle), math.cos(search_angle))
+
+        # ±30° 섹터 LiDAR 측정
+        raw_depth = self._measure_depth(search_angle, math.radians(30))
+        if raw_depth <= 0.0:
+            self.get_logger().debug(
+                f'[LiDAR] 방향({math.degrees(search_angle):.0f}°) 스캔 없음'
+            )
+            return None
+
+        # 예상 거리 대비 1.5m 초과 차이 → 다른 장애물
+        if abs(raw_depth - expected_dist) > 1.5:
+            self.get_logger().debug(
+                f'[LiDAR] 거리 불일치: 측정={raw_depth:.2f}m 예상={expected_dist:.2f}m'
+            )
+            return None
+
+        self.get_logger().info(
+            f'[LiDAR] 추적 성공: {raw_depth:.2f}m @ {math.degrees(search_angle):.0f}°'
+        )
+
+        map_x, map_y = self._depth_to_map(raw_depth, search_angle)
+        if map_x is None:
+            return None
+
+        return raw_depth, map_x, map_y, search_angle
+
+    def _publish_lidar_estimate(self, depth: float, map_x: float, map_y: float,
+                                angle: float):
+        """LiDAR 전용 위치 추정 퍼블리시 (confidence=0.3으로 구분)."""
+        ema = self._get_depth_ema(self.target_class)
+        smooth = ema.update(depth)
+
+        traj = self._get_trajectory(self.target_class)
+        traj.update(map_x, map_y)
+
+        # 마지막 위치 갱신 (다음 LiDAR 탐색 기준점)
+        self._last_known_map_x = map_x
+        self._last_known_map_y = map_y
+        self._last_known_depth = smooth
+        self._last_known_angle = angle
+
+        est = ObjectEstimate()
+        est.header.stamp = self.get_clock().now().to_msg()
+        est.header.frame_id = self.map_frame
+        est.class_id = self.target_class
+        est.confidence = 0.3        # LiDAR 전용 식별자 (카메라 threshold 0.35 미만)
+        est.depth = smooth
+        est.angle = angle
+        est.map_x = map_x
+        est.map_y = map_y
+        est.depth_valid = True
+        est.map_valid = True
+
+        out = ObjectEstimateArray()
+        out.header.stamp = est.header.stamp
+        out.header.frame_id = self.map_frame
+        out.estimates = [est]
+        self.estimates_pub.publish(out)
+        self._loc_index.add(self.target_class, map_x, map_y)
+
+    def _publish_last_known_estimate(self):
+        """마지막으로 알려진 위치를 estimate로 유지 퍼블리시 (confidence=0.1)."""
+        if self._last_known_map_x is None:
+            return
+
+        est = ObjectEstimate()
+        est.header.stamp = self.get_clock().now().to_msg()
+        est.header.frame_id = self.map_frame
+        est.class_id = self.target_class
+        est.confidence = 0.1        # 마지막 위치 식별자
+        est.depth = self._last_known_depth if self._last_known_depth is not None else -1.0
+        est.angle = self._last_known_angle if self._last_known_angle is not None else 0.0
+        est.map_x = self._last_known_map_x
+        est.map_y = self._last_known_map_y
+        est.depth_valid = (
+            self._last_known_depth is not None and self._last_known_depth > 0
+        )
+        est.map_valid = True
+
+        out = ObjectEstimateArray()
+        out.header.stamp = est.header.stamp
+        out.header.frame_id = self.map_frame
+        out.estimates = [est]
+        self.estimates_pub.publish(out)
 
     def _compute_search_angle(self, target_map_x: float, target_map_y: float) -> float | None:
         """

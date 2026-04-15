@@ -1,0 +1,79 @@
+slam_toolbox:
+  ros__parameters:
+
+    # Solver
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ROS 프레임 / 토픽
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    mode: mapping
+
+    # 디버그
+    debug_logging: false
+    throttle_scans: 1
+
+    # 맵 퍼블리시 주기 (초) — 기본값 5.0 → 1.0으로 낮춰 빠르게 확인
+    map_update_interval: 1.0
+    resolution: 0.05
+    max_laser_range: 16.0
+
+    # TF 설정
+    transform_publish_period: 0.02
+    transform_timeout: 0.5
+    tf_buffer_duration: 30.0
+
+    # 오도메트리 없이 시간 기반으로만 스캔 처리
+    # (로봇이 정지해 있어도 스캔 추가)
+    minimum_time_interval: 0.2
+    minimum_travel_distance: 0.0
+    minimum_travel_heading: 0.0
+
+    # Lifecycle 자동 시작 (configure → activate 자동 수행)
+    autostart: true
+
+    # 기타
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+    use_map_saver: false
+
+    # 스캔 매칭
+    use_scan_matching: true
+    use_scan_barycenter: true
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # 상관 파라미터
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # 스캔 매처
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 2
+    occupancy_threshold: 0.1

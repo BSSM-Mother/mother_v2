@@ -1,11 +1,11 @@
 """
 slam.launch.py
 ──────────────────────────────────────────────────────────────────────────────
-Hector SLAM + 객체 위치 추정 노드 런치 파일
+slam_toolbox + 객체 위치 추정 노드 런치 파일
 
 시작 노드:
-  1) hector_mapping   — /scan → map TF + /slam_out_pose 퍼블리시
-  2) slam_localization_node — 라이다 깊이 융합 + 궤적 예측 + 장소 인덱싱
+  1) async_slam_toolbox_node — /scan → map TF + /pose 퍼블리시
+  2) slam_localization_node  — 라이다 깊이 융합 + 궤적 예측 + 장소 인덱싱
 
 사용법:
   # SLAM만 단독 실행 (다른 노드와 결합)
@@ -19,18 +19,22 @@ Hector SLAM + 객체 위치 추정 노드 런치 파일
 
 필수 조건:
   - /scan 토픽이 퍼블리시되어야 함 (라이다 드라이버 별도 실행)
-  - hector_slam ROS2 패키지 설치 필요:
-      sudo apt install ros-jazzy-hector-slam
-      (또는 소스 빌드: https://github.com/tu-darmstadt-ros-pkg/hector_slam)
+  - slam_toolbox 설치 필요:
+      sudo apt install ros-jazzy-slam-toolbox
 """
 
+import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
+    bringup_share = get_package_share_directory('motherv2_bringup')
+    slam_params_file = os.path.join(bringup_share, 'config', 'slam_params.yaml')
+
     return LaunchDescription([
         # ── 런치 인자 ──────────────────────────────────────────────────────
         # LiDAR 설정
@@ -41,22 +45,16 @@ def generate_launch_description():
             'base_frame', default_value='base_link',
             description='로봇 기준 프레임'),
         DeclareLaunchArgument(
-            'odom_frame', default_value='odom',
-            description='Odometry 프레임 (odometry 없을 경우 base_link와 동일하게 설정)'),
+            'odom_frame', default_value='base_link',
+            description='Odometry 프레임 — odom 없이 쓸 경우 base_link와 동일하게 설정'),
         DeclareLaunchArgument(
             'map_frame', default_value='map',
             description='맵 프레임'),
 
-        # hector_mapping 맵 설정
+        # slam_toolbox 맵 설정
         DeclareLaunchArgument(
             'map_resolution', default_value='0.05',
             description='맵 해상도 (미터/셀)'),
-        DeclareLaunchArgument(
-            'map_size', default_value='2048',
-            description='맵 크기 (셀 수, N×N)'),
-        DeclareLaunchArgument(
-            'map_update_throttle', default_value='0.4',
-            description='맵 업데이트 최소 주기 (초)'),
 
         # 카메라 / 라이다 융합 파라미터
         DeclareLaunchArgument(
@@ -72,8 +70,8 @@ def generate_launch_description():
             'target_depth_m', default_value='0.8',
             description='라이다 기반 목표 추적 거리 (미터)'),
         DeclareLaunchArgument(
-            'target_class_id', default_value='39',
-            description='추적 대상 COCO class_id (기본값 39=bottle)'),
+            'target_class_id', default_value='0',
+            description='추적 대상 COCO class_id (0=person)'),
         DeclareLaunchArgument(
             'lost_timeout_s', default_value='1.5',
             description='객체 로스트 판정 시간 (초)'),
@@ -85,52 +83,53 @@ def generate_launch_description():
             default_value='/root/.ros/motherv2/location_index.json',
             description='장소 인덱스 JSON 저장 경로'),
 
-        # ── hector_mapping 노드 ────────────────────────────────────────────
-        # /scan → map TF, /slam_out_pose, /map 퍼블리시
+        # ── odom 없이 동작하기 위한 identity TF ──────────────────────────────
+        # slam_toolbox가 odom→base_link TF를 요구하므로 static identity 발행
         Node(
-            package='hector_mapping',
-            executable='hector_mapping',
-            name='hector_mapping',
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='odom_to_base_link',
+            arguments=['0', '0', '0', '0', '0', '0', 'odom', 'base_link'],
             output='screen',
-            parameters=[{
-                # 프레임 설정
-                'base_frame': LaunchConfiguration('base_frame'),
-                'odom_frame': LaunchConfiguration('odom_frame'),
-                'map_frame': LaunchConfiguration('map_frame'),
-
-                # 맵 설정
-                'map_resolution': LaunchConfiguration('map_resolution'),
-                'map_size': LaunchConfiguration('map_size'),
-                'map_update_distance_thresh': 0.4,
-                'map_update_angle_thresh': 0.06,   # ~3.4°
-                'map_pub_period': 2.0,
-
-                # 스캔 매칭 품질
-                'laser_min_dist': 0.1,
-                'laser_max_dist': 8.0,
-                'laser_z_min_value': -1.0,
-                'laser_z_max_value': 2.0,
-
-                # TF 퍼블리시
-                'pub_map_odom_transform': True,
-                'pub_map_scanmatch_transform': True,
-
-                # 로봇에 오도메트리가 없을 때: odom_frame = base_frame 으로 설정하고
-                # use_tf_scan_transformation = false 로 설정해야 함
-                'use_tf_scan_transformation': True,
-                'use_tf_pose_start_estimate': False,
-
-                # 스캔 매칭 파라미터
-                'map_multi_res_levels': 3,
-                'update_factor_free': 0.4,
-                'update_factor_occupied': 0.9,
-                'occupied_threshold': 0.7,
-                'free_threshold': 0.3,
-            }],
-            remappings=[
-                ('scan', '/scan'),
-            ],
         ),
+
+        # ── slam_toolbox 노드 ─────────────────────────────────────────────
+        # /scan → map TF, /pose, /map 퍼블리시 (오도메트리 없이 동작)
+        # 파라미터는 config/slam_params.yaml 로 관리 (inline dict 방식보다 안정적)
+        Node(
+            package='slam_toolbox',
+            executable='async_slam_toolbox_node',
+            name='slam_toolbox',
+            output='screen',
+            emulate_tty=True,
+            parameters=[slam_params_file],
+        ),
+
+        # ── slam_toolbox lifecycle 확인 ───────────────────────────────────
+        # autostart:true 파라미터로 자동 activate 됨 (slam_params.yaml 참고)
+        # 이 루프는 활성화 여부만 확인하고, 실패 시 수동 전환을 시도
+        TimerAction(period=5.0, actions=[
+            ExecuteProcess(
+                cmd=[
+                    'bash', '-c',
+                    'for i in 1 2 3 4 5 6 7 8 9 10; do '
+                    '  state=$(ros2 lifecycle get /slam_toolbox 2>/dev/null); '
+                    '  if echo "$state" | grep -qi active; then '
+                    '    echo "[lifecycle] SLAM active OK (autostart)"; exit 0; '
+                    '  fi; '
+                    '  if ros2 lifecycle set /slam_toolbox configure 2>/dev/null; then '
+                    '    sleep 1; '
+                    '    ros2 lifecycle set /slam_toolbox activate 2>/dev/null && '
+                    '      echo "[lifecycle] SLAM active OK (manual)" && exit 0; '
+                    '  fi; '
+                    '  echo "[lifecycle] /slam_toolbox 대기 중... ($i/10)"; '
+                    '  sleep 3; '
+                    'done; '
+                    'echo "[lifecycle] SLAM 시작 실패 - slam_toolbox 확인 필요"'
+                ],
+                output='screen',
+            ),
+        ]),
 
         # ── slam_localization_node ─────────────────────────────────────────
         # LiDAR 깊이 융합 + 맵 좌표 변환 + 궤적 예측 + 장소 인덱싱

@@ -1,5 +1,7 @@
 import json
 import math
+import os
+import subprocess
 import threading
 import time
 from collections import deque
@@ -9,8 +11,8 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from sensor_msgs.msg import Image, LaserScan
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
@@ -36,6 +38,29 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     slam_state = {}            # JSON-serializable dict
     slam_state_lock = threading.Lock()
 
+    # 장소 인덱스
+    _places_file = os.path.expanduser('~/.ros/motherv2/places.json')
+    places_data: list = []
+    places_lock = threading.Lock()
+
+    @classmethod
+    def load_places(cls):
+        try:
+            if os.path.exists(cls._places_file):
+                with open(cls._places_file, 'r', encoding='utf-8') as f:
+                    cls.places_data = json.load(f)
+        except Exception:
+            cls.places_data = []
+
+    @classmethod
+    def _save_places(cls):
+        try:
+            os.makedirs(os.path.dirname(cls._places_file), exist_ok=True)
+            with open(cls._places_file, 'w', encoding='utf-8') as f:
+                json.dump(cls.places_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     def log_message(self, format, *args):
         pass
 
@@ -52,8 +77,20 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self._slam_map()
         elif self.path == '/slam_state':
             self._slam_state_json()
+        elif self.path == '/places':
+            self._places_json()
         else:
             self._index()
+
+    def do_POST(self):
+        if self.path == '/add_place':
+            self._add_place()
+        elif self.path == '/delete_place':
+            self._delete_place()
+        elif self.path == '/save_map':
+            self._save_map_handler()
+        else:
+            self.send_error(404)
 
     # ── 기존 엔드포인트 ───────────────────────────────────────────────────
 
@@ -78,6 +115,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _motor_json(self):
+        with self.motor_lock:
+            data = dict(self.motor_state)
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _state_json(self):
         with self.motor_lock:
@@ -131,6 +178,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         """로봇/객체/예측 위치 JSON."""
         with self.slam_state_lock:
             data = dict(self.slam_state)
+        # 장소 인덱스 포함
+        with self.places_lock:
+            data['places'] = list(self.places_data)
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -138,6 +188,92 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(body)
+
+    def _places_json(self):
+        with self.places_lock:
+            data = list(self.places_data)
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_response(self, data: dict, status: int = 200):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length)
+        return json.loads(raw)
+
+    def _add_place(self):
+        """현재 로봇 위치를 이름으로 저장."""
+        try:
+            data = self._read_json_body()
+            name = str(data.get('name', '')).strip()
+        except Exception:
+            self._json_response({'ok': False, 'error': 'bad json'}, 400)
+            return
+        if not name:
+            self._json_response({'ok': False, 'error': 'name required'}, 400)
+            return
+        with self.slam_state_lock:
+            robot = self.slam_state.get('robot', {})
+        if not robot.get('valid'):
+            self._json_response({'ok': False, 'error': 'robot TF not available'}, 503)
+            return
+        place = {
+            'name': name,
+            'x': round(robot['x'], 3),
+            'y': round(robot['y'], 3),
+            'time': int(time.time()),
+        }
+        with self.places_lock:
+            # 같은 이름 있으면 덮어쓰기
+            self.places_data = [p for p in self.places_data if p['name'] != name]
+            self.places_data.append(place)
+            self._save_places()
+        self._json_response({'ok': True, 'place': place})
+
+    def _delete_place(self):
+        """이름으로 장소 삭제."""
+        try:
+            data = self._read_json_body()
+            name = str(data.get('name', '')).strip()
+        except Exception:
+            self._json_response({'ok': False, 'error': 'bad json'}, 400)
+            return
+        with self.places_lock:
+            before = len(self.places_data)
+            self.places_data = [p for p in self.places_data if p['name'] != name]
+            self._save_places()
+            deleted = before - len(self.places_data)
+        self._json_response({'ok': True, 'deleted': deleted})
+
+    def _save_map_handler(self):
+        """slam_toolbox로 맵 저장."""
+        map_dir = os.path.expanduser('~/maps')
+        os.makedirs(map_dir, exist_ok=True)
+        map_path = os.path.join(map_dir, 'slam_map')
+        try:
+            result = subprocess.run(
+                ['ros2', 'service', 'call',
+                 '/slam_toolbox/serialize_map',
+                 'slam_toolbox/srv/SerializePoseGraph',
+                 f'{{filename: "{map_path}"}}'],
+                capture_output=True, text=True, timeout=15,
+            )
+            ok = result.returncode == 0
+            self._json_response({'ok': ok, 'path': map_path,
+                                  'msg': (result.stdout if ok else result.stderr)[:200]})
+        except Exception as e:
+            self._json_response({'ok': False, 'error': str(e)}, 500)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,6 +308,10 @@ class WebNode(Node):
         self._robot_pose_lock = threading.Lock()
         self._robot_pose = None             # (x, y, yaw)
 
+        # ── LiDAR 스캔 ────────────────────────────────────────────────────
+        self._scan_lock = threading.Lock()
+        self._scan_points = []              # list of [x, y] (robot-relative, downsampled)
+
         # ── TF2 ────────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -196,9 +336,19 @@ class WebNode(Node):
         )
 
         # ── 구독: SLAM ──────────────────────────────────────────────────────
-        # /map 은 hector_mapping이 RELIABLE로 퍼블리시 (latch)
+        # slam_toolbox 버전에 따라 /map QoS가 TRANSIENT_LOCAL 또는 VOLATILE
+        # VOLATILE 구독은 두 경우 모두 호환됨 (TRANSIENT_LOCAL과 달리 강제 요구 없음)
+        # slam_toolbox가 1Hz로 주기 퍼블리시하므로 latching 불필요
+        map_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self._map_callback, 1)
+            OccupancyGrid, '/map', self._map_callback, map_qos)
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self._scan_callback, sensor_qos)
         self.estimates_sub = self.create_subscription(
             ObjectEstimateArray, '/motherv2/object_estimates',
             self._estimates_callback, 1)
@@ -215,6 +365,7 @@ class WebNode(Node):
         self.create_timer(0.1, self._update_robot_pose)
 
         # ── HTTP 서버 ──────────────────────────────────────────────────────
+        MJPEGHandler.load_places()
         self.server = ThreadingHTTPServer(('0.0.0.0', port), MJPEGHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
@@ -293,6 +444,20 @@ class WebNode(Node):
         with self._map_lock:
             self._occupancy_grid = msg
 
+    def _scan_callback(self, msg: LaserScan):
+        """LiDAR 스캔 → 로봇 기준 XY 포인트로 변환 (180포인트로 다운샘플)."""
+        pts = []
+        total = len(msg.ranges)
+        step = max(1, total // 180)
+        for i in range(0, total, step):
+            r = msg.ranges[i]
+            if msg.range_min <= r <= msg.range_max:
+                angle = msg.angle_min + i * msg.angle_increment
+                pts.append([round(r * math.cos(angle), 2),
+                             round(r * math.sin(angle), 2)])
+        with self._scan_lock:
+            self._scan_points = pts
+
     def _estimates_callback(self, msg: ObjectEstimateArray):
         objs = []
         for est in msg.estimates:
@@ -300,6 +465,7 @@ class WebNode(Node):
                 'class_id': est.class_id,
                 'confidence': round(est.confidence, 2),
                 'depth': round(est.depth, 3),
+                'angle': round(est.angle, 3),
                 'map_x': round(est.map_x, 3),
                 'map_y': round(est.map_y, 3),
                 'depth_valid': est.depth_valid,
@@ -376,20 +542,15 @@ class WebNode(Node):
         ch, cw = cropped.shape
 
         # 색상 변환 (BGR)
-        # 미지: #222222, 빈 공간: #3a3a44, 점유: #00ff66
+        # 미지: #161616 (매우 어두움), 빈 공간: #c8c8c8 (밝은 회색), 점유: #00cc44 (초록)
         img = np.zeros((ch, cw, 3), dtype=np.uint8)
         unknown = cropped < 0
         free = cropped == 0
         occupied = cropped > 0
 
-        img[unknown] = (34, 34, 34)
-        img[free] = (68, 58, 58)
-
-        # 점유도에 따라 녹색 그라데이션
-        occ_vals = cropped[occupied].astype(np.float32) / 100.0
-        img[occupied, 0] = 0                                    # B
-        img[occupied, 1] = (100 + 155 * occ_vals).astype(np.uint8)  # G
-        img[occupied, 2] = 0                                    # R
+        img[unknown] = (20, 20, 20)      # 검정 (미탐색)
+        img[free] = (200, 200, 200)      # 밝은 회색 (탐색된 빈 공간)
+        img[occupied] = (20, 20, 20)     # 검정 (벽/장애물) — unknown과 동일
 
         # y축 뒤집기 (ROS 맵: 아래→위, 이미지: 위→아래)
         img = cv2.flip(img, 0)
@@ -426,13 +587,16 @@ class WebNode(Node):
         }
 
     def _update_slam_state(self):
-        """SLAM 상태 JSON 업데이트 (로봇 포즈, 객체, 예측, 궤적)."""
+        """SLAM 상태 JSON 업데이트 (로봇 포즈, 객체, 예측, 궤적, 스캔)."""
         with self._robot_pose_lock:
             rp = self._robot_pose
 
         with self._slam_obj_lock:
             objs = list(self._slam_objects)
             pred = self._slam_prediction
+
+        with self._scan_lock:
+            scan_pts = list(self._scan_points)
 
         traj = list(self._slam_trajectory)
         map_info = getattr(self, '_map_render_info', {'available': False})
@@ -448,6 +612,7 @@ class WebNode(Node):
             'objects': objs,
             'prediction': pred,
             'trajectory': [[round(x, 3), round(y, 3)] for x, y in traj[-100:]],
+            'scan': scan_pts,
         }
 
         with MJPEGHandler.slam_state_lock:
@@ -455,6 +620,9 @@ class WebNode(Node):
 
     def destroy_node(self):
         self.server.shutdown()
+        # TF2 리스너 스레드를 먼저 정리해야 SIGINT 시 SIGABRT 방지
+        self.tf_listener = None
+        self.tf_buffer = None
         super().destroy_node()
 
 
@@ -475,11 +643,20 @@ h1{color:#0f0;margin:0 0 12px;font-size:1.3em}
 .panel h2{color:#888;font-size:.7em;margin:0 0 8px;text-transform:uppercase;letter-spacing:2px}
 #stream-img{max-width:100%;border-radius:6px;display:block}
 canvas{display:block;margin:0 auto;border-radius:6px}
-#slam-canvas{background:#222;border:1px solid #444}
+#slam-canvas{background:#161616;border:1px solid #444}
 .slam-info{font-size:.75em;color:#888;margin-top:8px;text-align:left;line-height:1.6}
 .slam-info span{color:#0f0}
-.legend{display:flex;gap:12px;justify-content:center;font-size:.65em;color:#aaa;margin-top:6px}
+.legend{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;font-size:.65em;color:#aaa;margin-top:6px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:3px;vertical-align:middle}
+.place-ctrl{display:flex;gap:6px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.place-ctrl input{background:#222;border:1px solid #444;color:#eee;padding:5px 8px;border-radius:4px;font-family:monospace;font-size:.8em;flex:1;min-width:120px}
+.place-ctrl button{background:#1e3a1e;border:1px solid #2a5a2a;color:#0f0;padding:5px 10px;border-radius:4px;cursor:pointer;font-size:.8em;white-space:nowrap}
+.place-ctrl button:hover{background:#2a5a2a}
+#place-list{margin-top:8px;font-size:.72em;color:#aaa;text-align:left;max-height:80px;overflow-y:auto}
+#place-list .pi{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #222}
+#place-list .pi .pname{color:#aa66ff}
+#place-list .pi .pdel{color:#555;cursor:pointer;padding:0 4px}
+#place-list .pi .pdel:hover{color:#f66}
 </style>
 </head>
 <body>
@@ -499,17 +676,26 @@ canvas{display:block;margin:0 auto;border-radius:6px}
 </div>
 
 <!-- SLAM 맵 -->
-<div class="panel" id="slam-panel" style="display:none">
-<h2>SLAM Map</h2>
+<div class="panel" id="slam-panel">
+<h2>SLAM Map / LiDAR</h2>
 <canvas id="slam-canvas" width="420" height="420"></canvas>
 <div class="legend">
-  <div><i style="background:#3a3a44"></i>Free</div>
-  <div><i style="background:#00ff66"></i>Wall</div>
+  <div><i style="background:#c8c8c8"></i>Free</div>
+  <div><i style="background:#00cc44"></i>Wall</div>
   <div><i style="background:#00ccff"></i>Robot</div>
-  <div><i style="background:#ff3366"></i>Object</div>
-  <div><i style="background:#ffaa00;border-radius:0;border:1px dashed #ffaa00"></i>Prediction</div>
+  <div><i style="background:#ff3366"></i>CAM</div>
+  <div><i style="background:#ff8800"></i>LiDAR</div>
+  <div><i style="background:#ffcc00"></i>Last</div>
+  <div><i style="background:#ffaa00;border-radius:0;border:1px dashed #ffaa00"></i>Pred</div>
+  <div><i style="background:#aa66ff"></i>Place</div>
 </div>
 <div class="slam-info" id="slam-info"></div>
+<div class="place-ctrl">
+  <input id="place-name" type="text" placeholder="장소 이름 (예: 거실)" maxlength="20">
+  <button onclick="addPlace()">📍 인덱싱</button>
+  <button onclick="saveMap()" id="btn-savemap">💾 맵 저장</button>
+</div>
+<div id="place-list"></div>
 </div>
 
 </div>
@@ -577,136 +763,261 @@ setInterval(function(){
   fetch("/motor").then(function(r){if(r.ok)return r.json();}).then(function(d){if(d)drawMotor(d);}).catch(function(){});
 },100);
 
-// ── SLAM 캔버스 ──────────────────────────────────────────────────────────
+// ── SLAM / LiDAR 캔버스 ──────────────────────────────────────────────────
 var sc2=document.getElementById("slam-canvas"),sctx=sc2.getContext("2d");
 var sW=sc2.width,sH=sc2.height;
-var sPanel=document.getElementById("slam-panel");
 var sInfo=document.getElementById("slam-info");
 var mapImg=new Image();
 var mapLoaded=false;
-var slamActive=false;
+var SD=null;  // 최신 slam_state 데이터 캐시
 
-// 맵 이미지 로드 (3초 주기)
+// ── 데이터 fetch (렌더링과 분리) ─────────────────────────────────────────
+function fetchSD(){
+  fetch("/slam_state")
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d)SD=d;})
+    .catch(function(){});
+}
+setInterval(fetchSD,200);fetchSD();
+
 function loadMap(){
   var img=new Image();
-  img.onload=function(){mapImg=img;mapLoaded=true;if(!slamActive){sPanel.style.display="block";slamActive=true;}};
-  img.onerror=function(){};
+  img.onload=function(){mapImg=img;mapLoaded=true;};
   img.src="/slam_map?t="+Date.now();
 }
-setInterval(loadMap,3000);
-loadMap();
+setInterval(loadMap,2000);loadMap();
 
-// 맵 좌표 → 캔버스 픽셀 변환
-function mapToCanvas(mx,my,mi){
-  if(!mi||!mi.available)return null;
-  // 맵 좌표 → 크롭 이미지 픽셀
+// ── 좌표 변환 헬퍼 ───────────────────────────────────────────────────────
+function m2c(mx,my,mi,ox,oy,s){
   var px=(mx-mi.crop_origin_x)/mi.crop_w_m*mi.img_w;
   var py=mi.img_h-(my-mi.crop_origin_y)/mi.crop_h_m*mi.img_h;
-  // 이미지 픽셀 → 캔버스 픽셀
-  var sx=sW/mi.img_w, sy=sH/mi.img_h;
-  var s=Math.min(sx,sy);
-  var offX=(sW-mi.img_w*s)/2, offY=(sH-mi.img_h*s)/2;
-  return {x:offX+px*s, y:offY+py*s};
+  return {x:ox+px*s,y:oy+py*s};
+}
+function drawDot(x,y,conf,depth,dv){
+  var col=conf>0.25?"#ff3366":conf>0.15?"#ff8800":"#ffcc00";
+  var lbl=conf>0.25?"CAM":conf>0.15?"LiDAR":"LAST";
+  sctx.fillStyle=col;sctx.beginPath();sctx.arc(x,y,7,0,Math.PI*2);sctx.fill();
+  sctx.strokeStyle=col;sctx.lineWidth=1.5;sctx.beginPath();sctx.arc(x,y,7,0,Math.PI*2);sctx.stroke();
+  sctx.fillStyle="#fff";sctx.font="bold 9px monospace";sctx.textAlign="center";
+  sctx.fillText(lbl,x,y-11);
+  if(dv&&depth>0)sctx.fillText(depth.toFixed(1)+"m",x,y+19);
 }
 
-// SLAM 상태 폴링 + 렌더 (200ms)
-function drawSlam(){
-  fetch("/slam_state").then(function(r){if(r.ok)return r.json();}).then(function(d){
-    if(!d||!d.map_info||!d.map_info.available)return;
-    if(!slamActive){sPanel.style.display="block";slamActive=true;}
+// ── 렌더 루프 (순수 동기, 항상 실행) ────────────────────────────────────
+function renderSlam(){
+  sctx.clearRect(0,0,sW,sH);
+  sctx.fillStyle="#161616";sctx.fillRect(0,0,sW,sH);
 
+  var d=SD;
+  if(!d){
+    sctx.fillStyle="#aaa";sctx.font="13px monospace";sctx.textAlign="center";
+    sctx.fillText("연결 중...",sW/2,sH/2);
+    return;
+  }
+
+  var hasMap=!!(d.map_info&&d.map_info.available&&mapImg.complete&&mapImg.naturalWidth>0);
+  var hasScan=!!(d.scan&&d.scan.length>0);
+
+  if(!hasMap&&!hasScan){
+    sctx.fillStyle="#aaa";sctx.font="13px monospace";sctx.textAlign="center";
+    sctx.fillText("SLAM / LiDAR 대기중...",sW/2,sH/2-10);
+    sctx.fillStyle="#666";sctx.font="11px monospace";
     var mi=d.map_info;
-    sctx.clearRect(0,0,sW,sH);
-    sctx.fillStyle="#222";sctx.fillRect(0,0,sW,sH);
+    sctx.fillText("scan:"+(d.scan?d.scan.length:0)+"pts  map:"+(mi&&mi.available?"OK":"없음"),sW/2,sH/2+12);
+    return;
+  }
 
-    // 맵 이미지 그리기 (aspect ratio 유지)
-    if(mapLoaded){
-      var sx=sW/mi.img_w, sy=sH/mi.img_h;
-      var s=Math.min(sx,sy);
-      var offX=(sW-mi.img_w*s)/2, offY=(sH-mi.img_h*s)/2;
-      sctx.drawImage(mapImg,offX,offY,mi.img_w*s,mi.img_h*s);
-    }
+  if(hasMap){
+    // ── SLAM 맵 모드 ────────────────────────────────────────────────
+    var mi=d.map_info;
+    var s=Math.min(sW/mi.img_w,sH/mi.img_h);
+    var ox=(sW-mi.img_w*s)/2,oy=(sH-mi.img_h*s)/2;
+    sctx.drawImage(mapImg,ox,oy,mi.img_w*s,mi.img_h*s);
 
-    // 궤적 라인
+    // 궤적
     if(d.trajectory&&d.trajectory.length>1){
-      sctx.strokeStyle="rgba(255,100,200,0.4)";sctx.lineWidth=2;
-      sctx.beginPath();
+      sctx.strokeStyle="rgba(255,100,200,0.4)";sctx.lineWidth=2;sctx.beginPath();
       for(var i=0;i<d.trajectory.length;i++){
-        var p=mapToCanvas(d.trajectory[i][0],d.trajectory[i][1],mi);
-        if(!p)continue;
-        if(i===0)sctx.moveTo(p.x,p.y);else sctx.lineTo(p.x,p.y);
-      }
-      sctx.stroke();
+        var p=m2c(d.trajectory[i][0],d.trajectory[i][1],mi,ox,oy,s);
+        i===0?sctx.moveTo(p.x,p.y):sctx.lineTo(p.x,p.y);
+      }sctx.stroke();
     }
-
-    // 예측 위치 (점선 원)
+    // 예측 위치
     if(d.prediction){
-      var pp=mapToCanvas(d.prediction.x,d.prediction.y,mi);
-      if(pp){
-        sctx.strokeStyle="#ffaa00";sctx.lineWidth=2;
-        sctx.setLineDash([5,5]);
-        sctx.beginPath();sctx.arc(pp.x,pp.y,12,0,Math.PI*2);sctx.stroke();
-        sctx.setLineDash([]);
-        sctx.fillStyle="#ffaa00";sctx.font="bold 10px monospace";sctx.textAlign="center";
-        sctx.fillText("PRED",pp.x,pp.y-16);
-      }
+      var pp=m2c(d.prediction.x,d.prediction.y,mi,ox,oy,s);
+      sctx.strokeStyle="#ffaa00";sctx.lineWidth=2;sctx.setLineDash([5,5]);
+      sctx.beginPath();sctx.arc(pp.x,pp.y,12,0,Math.PI*2);sctx.stroke();
+      sctx.setLineDash([]);
+      sctx.fillStyle="#ffaa00";sctx.font="bold 10px monospace";sctx.textAlign="center";
+      sctx.fillText("PRED",pp.x,pp.y-16);
     }
-
-    // 객체 위치
+    // 객체
     if(d.objects){
       for(var i=0;i<d.objects.length;i++){
-        var o=d.objects[i];
-        if(!o.map_valid)continue;
-        var op=mapToCanvas(o.map_x,o.map_y,mi);
-        if(!op)continue;
-        sctx.fillStyle="#ff3366";
-        sctx.beginPath();sctx.arc(op.x,op.y,7,0,Math.PI*2);sctx.fill();
-        sctx.strokeStyle="#ff6699";sctx.lineWidth=2;
-        sctx.beginPath();sctx.arc(op.x,op.y,7,0,Math.PI*2);sctx.stroke();
-        sctx.fillStyle="#fff";sctx.font="bold 9px monospace";sctx.textAlign="center";
-        sctx.fillText(o.depth_valid?o.depth.toFixed(1)+"m":"?",op.x,op.y-11);
+        var o=d.objects[i];if(!o.map_valid)continue;
+        var op=m2c(o.map_x,o.map_y,mi,ox,oy,s);
+        drawDot(op.x,op.y,o.confidence,o.depth,o.depth_valid);
       }
     }
-
-    // 로봇 위치 (삼각형)
-    if(d.robot&&d.robot.valid){
-      var rp=mapToCanvas(d.robot.x,d.robot.y,mi);
-      if(rp){
-        var yaw=-d.robot.yaw; // 캔버스 y축 반전 보정
-        var sz=10;
-        sctx.save();sctx.translate(rp.x,rp.y);sctx.rotate(yaw);
-        sctx.fillStyle="#00ccff";sctx.beginPath();
-        sctx.moveTo(sz,0);sctx.lineTo(-sz*0.7,-sz*0.6);sctx.lineTo(-sz*0.7,sz*0.6);
-        sctx.closePath();sctx.fill();
-        sctx.strokeStyle="#00eeff";sctx.lineWidth=1.5;sctx.stroke();
-        sctx.restore();
+    // 장소 마커
+    if(d.places){
+      for(var i=0;i<d.places.length;i++){
+        var pl=d.places[i];
+        var pp2=m2c(pl.x,pl.y,mi,ox,oy,s);
+        sctx.fillStyle="#aa66ff";sctx.beginPath();sctx.arc(pp2.x,pp2.y,6,0,Math.PI*2);sctx.fill();
+        sctx.strokeStyle="#cc99ff";sctx.lineWidth=1.5;sctx.beginPath();sctx.arc(pp2.x,pp2.y,6,0,Math.PI*2);sctx.stroke();
+        sctx.fillStyle="#cc99ff";sctx.font="bold 9px monospace";sctx.textAlign="center";
+        sctx.fillText(pl.name,pp2.x,pp2.y-10);
       }
     }
-
-    // 정보 텍스트
-    var info="";
+    // 로봇
     if(d.robot&&d.robot.valid){
-      info+="Robot: <span>("+d.robot.x.toFixed(2)+", "+d.robot.y.toFixed(2)+")</span> yaw=<span>"+
-        (d.robot.yaw*180/Math.PI).toFixed(1)+"&deg;</span><br>";
-    }else{
-      info+="Robot: <span style='color:#f66'>TF not available</span><br>";
+      var rp=m2c(d.robot.x,d.robot.y,mi,ox,oy,s);
+      sctx.save();sctx.translate(rp.x,rp.y);sctx.rotate(-d.robot.yaw);
+      sctx.fillStyle="#00ccff";sctx.beginPath();
+      sctx.moveTo(10,0);sctx.lineTo(-7,-6);sctx.lineTo(-7,6);
+      sctx.closePath();sctx.fill();
+      sctx.strokeStyle="#00eeff";sctx.lineWidth=1.5;sctx.stroke();
+      sctx.restore();
     }
-    if(d.objects&&d.objects.length>0){
-      var o=d.objects[0];
-      info+="Object: ";
-      if(o.depth_valid)info+="depth=<span>"+o.depth.toFixed(2)+"m</span> ";
-      if(o.map_valid)info+="map=<span>("+o.map_x.toFixed(2)+", "+o.map_y.toFixed(2)+")</span>";
-      else info+="<span style='color:#f66'>no map</span>";
-      info+="<br>";
-    }
-    if(d.prediction)info+="Prediction: <span>("+d.prediction.x.toFixed(2)+", "+d.prediction.y.toFixed(2)+")</span><br>";
-    if(d.trajectory)info+="Trajectory: <span>"+d.trajectory.length+" pts</span>";
-    sInfo.innerHTML=info;
 
-  }).catch(function(){});
+  } else {
+    // ── LiDAR 레이더 모드 ───────────────────────────────────────────
+    var cx=sW/2,cy=sH/2,ppm=Math.min(sW,sH)/12;
+    // 거리 링
+    for(var rv=2;rv<=6;rv+=2){
+      sctx.strokeStyle="rgba(255,255,255,0.08)";sctx.lineWidth=1;
+      sctx.beginPath();sctx.arc(cx,cy,rv*ppm,0,Math.PI*2);sctx.stroke();
+      sctx.fillStyle="#555";sctx.font="9px monospace";sctx.textAlign="center";
+      sctx.fillText(rv+"m",cx,cy-rv*ppm+10);
+    }
+    // 십자선
+    sctx.strokeStyle="rgba(255,255,255,0.06)";sctx.lineWidth=1;
+    sctx.beginPath();sctx.moveTo(cx,0);sctx.lineTo(cx,sH);sctx.stroke();
+    sctx.beginPath();sctx.moveTo(0,cy);sctx.lineTo(sW,cy);sctx.stroke();
+    // 스캔 포인트
+    sctx.fillStyle="#00cc55";
+    for(var i=0;i<d.scan.length;i++){
+      var spx=cx+d.scan[i][1]*ppm,spy=cy+d.scan[i][0]*ppm;
+      sctx.fillRect(spx-1.5,spy-1.5,3,3);
+    }
+    // 객체
+    if(d.objects){
+      for(var i=0;i<d.objects.length;i++){
+        var o=d.objects[i];if(!o.depth_valid)continue;
+        var ang=o.angle||0;
+        drawDot(cx-o.depth*Math.sin(ang)*ppm,cy-o.depth*Math.cos(ang)*ppm,
+                o.confidence,o.depth,true);
+      }
+    }
+    // 장소 마커 (레이더 상대좌표)
+    if(d.places&&d.robot&&d.robot.valid){
+      var yaw=d.robot.yaw,rx=d.robot.x,ry=d.robot.y;
+      for(var i=0;i<d.places.length;i++){
+        var pl=d.places[i];
+        var dx=pl.x-rx,dy=pl.y-ry;
+        var lx=dx*Math.cos(-yaw)-dy*Math.sin(-yaw);
+        var ly=dx*Math.sin(-yaw)+dy*Math.cos(-yaw);
+        var ppx=cx-ly*ppm,ppy=cy-lx*ppm;
+        sctx.fillStyle="#aa66ff";sctx.beginPath();sctx.arc(ppx,ppy,6,0,Math.PI*2);sctx.fill();
+        sctx.strokeStyle="#cc99ff";sctx.lineWidth=1.5;sctx.beginPath();sctx.arc(ppx,ppy,6,0,Math.PI*2);sctx.stroke();
+        sctx.fillStyle="#cc99ff";sctx.font="bold 9px monospace";sctx.textAlign="center";
+        sctx.fillText(pl.name,ppx,ppy-10);
+      }
+    }
+    // 로봇 (레이더 중앙)
+    sctx.save();sctx.translate(cx,cy);
+    sctx.fillStyle="#00ccff";sctx.beginPath();
+    sctx.moveTo(0,-13);sctx.lineTo(-8,8);sctx.lineTo(8,8);
+    sctx.closePath();sctx.fill();
+    sctx.strokeStyle="#00eeff";sctx.lineWidth=1.5;sctx.stroke();
+    sctx.restore();
+    sctx.fillStyle="#444";sctx.font="10px monospace";sctx.textAlign="center";
+    sctx.fillText("LiDAR Radar · SLAM 맵 대기중",cx,sH-6);
+  }
+
+  // ── 텍스트 정보 ─────────────────────────────────────────────────────
+  var info="";
+  if(d.robot&&d.robot.valid){
+    info+="Robot: <span>("+d.robot.x.toFixed(2)+","+d.robot.y.toFixed(2)+")</span> "+
+          "yaw:<span>"+(d.robot.yaw*180/Math.PI).toFixed(1)+"&deg;</span><br>";
+  }else{
+    info+="Robot: <span style='color:#888'>TF 없음</span><br>";
+  }
+  if(d.places&&d.places.length>0&&d.robot&&d.robot.valid){
+    var rx=d.robot.x,ry=d.robot.y,nd=Infinity,nn="";
+    for(var i=0;i<d.places.length;i++){
+      var dd=Math.sqrt(Math.pow(d.places[i].x-rx,2)+Math.pow(d.places[i].y-ry,2));
+      if(dd<nd){nd=dd;nn=d.places[i].name;}
+    }
+    info+="위치: <span style='color:#aa66ff'>"+nn+"</span> <span>("+nd.toFixed(1)+"m)</span><br>";
+    renderPlaceList(d.places);
+  }
+  if(d.objects&&d.objects.length>0){
+    var o=d.objects[0];
+    var mode=o.confidence>0.25?"CAM":o.confidence>0.15?"LiDAR":"LAST";
+    var oc=o.confidence>0.25?"#ff3366":o.confidence>0.15?"#ff8800":"#ffcc00";
+    info+="Object[<span style='color:"+oc+"'>"+mode+"</span>]: ";
+    if(o.depth_valid)info+="<span>"+o.depth.toFixed(2)+"m</span> ";
+    if(o.map_valid)info+="map<span>("+o.map_x.toFixed(2)+","+o.map_y.toFixed(2)+")</span>";
+    info+="<br>";
+  }
+  if(d.scan)info+="Scan:<span>"+d.scan.length+"pts</span> ";
+  if(d.trajectory&&d.trajectory.length)info+="Traj:<span>"+d.trajectory.length+"pts</span>";
+  sInfo.innerHTML=info;
 }
-setInterval(drawSlam,200);
-drawSlam();
+setInterval(renderSlam,200);
+
+// ── 장소 인덱싱 기능 ──────────────────────────────────────────────────────
+function renderPlaceList(places){
+  var el=document.getElementById("place-list");
+  if(!el)return;
+  var html="";
+  for(var i=0;i<places.length;i++){
+    var p=places[i];
+    html+="<div class='pi'><span class='pname'>"+p.name+"</span>"+
+          "<span style='color:#666'>("+p.x.toFixed(2)+","+p.y.toFixed(2)+")</span>"+
+          "<span class='pdel' onclick='deletePlace(\\""+p.name+"\\")'>✕</span></div>";
+  }
+  el.innerHTML=html||"<span style='color:#555'>저장된 장소 없음</span>";
+}
+
+function addPlace(){
+  var name=document.getElementById("place-name").value.trim();
+  if(!name){alert("장소 이름을 입력하세요");return;}
+  fetch("/add_place",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name:name})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        document.getElementById("place-name").value="";
+        alert("저장: "+d.place.name+" ("+d.place.x+", "+d.place.y+")");
+      } else {
+        alert("실패: "+(d.error||"알 수 없는 오류"));
+      }
+    }).catch(function(){alert("서버 오류");});
+}
+
+function deletePlace(name){
+  if(!confirm(name+" 삭제?"))return;
+  fetch("/delete_place",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name:name})})
+    .then(function(r){return r.json();})
+    .then(function(d){if(!d.ok)alert("삭제 실패");})
+    .catch(function(){});
+}
+
+function saveMap(){
+  var btn=document.getElementById("btn-savemap");
+  btn.textContent="저장 중...";btn.disabled=true;
+  fetch("/save_map",{method:"POST"})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      btn.textContent="💾 맵 저장";btn.disabled=false;
+      if(d.ok)alert("맵 저장 완료\\n경로: "+d.path);
+      else alert("맵 저장 실패\\n"+d.error);
+    }).catch(function(){btn.textContent="💾 맵 저장";btn.disabled=false;alert("서버 오류");});
+}
 </script>
 </body>
 </html>'''

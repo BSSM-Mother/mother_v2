@@ -51,8 +51,11 @@ def generate_launch_description():
             'lidar_angle_offset_rad', default_value='0.0',
             description='카메라-라이다 수평 각도 오프셋 (라디안)'),
         DeclareLaunchArgument(
-            'target_class_id', default_value='39',
-            description='추적 대상 COCO class_id'),
+            'target_class_id', default_value='0',
+            description='추적 대상 COCO class_id (0=person)'),
+        DeclareLaunchArgument(
+            'lidar_port', default_value='/dev/ttyAMA2',
+            description='라이다 시리얼 포트 (use_slam=true 일 때 사용)'),
     ]
 
     nodes = [
@@ -146,6 +149,25 @@ def generate_launch_description():
         ),
 
         # ── SLAM (use_slam:=true 일 때만 실행) ────────────────────────────
+        # 라이다 드라이버
+        Node(
+            package='echo_lidar',
+            executable='sllidar_node',
+            name='sllidar_node',
+            parameters=[{
+                'channel_type': 'serial',
+                'serial_port': LaunchConfiguration('lidar_port'),
+                'serial_baudrate': 460800,
+                'frame_id': 'base_link',
+                'inverted': False,
+                'angle_compensate': True,
+                'scan_mode': 'Standard',
+                'scan_frequency': 10.0,
+            }],
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('use_slam')),
+        ),
+
         # hector_mapping + slam_localization_node
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(slam_launch_path),

@@ -8,6 +8,7 @@ source /opt/ros/jazzy/setup.bash
 
 colcon build --symlink-install --parallel-workers 2 \
   --packages-select \
+    echo_lidar \
     motherv2_interfaces \
     motherv2_camera \
     motherv2_detection \
@@ -15,6 +16,7 @@ colcon build --symlink-install --parallel-workers 2 \
     motherv2_serial \
     motherv2_web \
     motherv2_mqtt \
+    motherv2_slam \
     motherv2_bringup
 
 source install/setup.bash

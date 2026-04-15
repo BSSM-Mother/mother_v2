@@ -71,6 +71,16 @@ class ApiNode(Node):
             self.get_logger().warn(f'API 요청 실패: {e}')
             return
 
+        if isinstance(data, list):
+            if not data:
+                self.get_logger().warn('API 응답이 빈 리스트입니다.')
+                return
+            data = data[0]
+
+        if not isinstance(data, dict):
+            self.get_logger().warn(f'API 응답 형식 오류: {type(data).__name__}')
+            return
+
         follow = int(data.get('follow', 0))
         buzzer = int(data.get('buzzer', 0))
 
