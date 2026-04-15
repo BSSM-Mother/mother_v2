@@ -19,7 +19,7 @@ from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 from motherv2_interfaces.msg import DetectionArray, MotorCommand, ObjectEstimateArray
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,6 +43,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     _places_file = os.path.expanduser('~/.ros/motherv2/places.json')
     places_data: list = []
     places_lock = threading.Lock()
+
+    # 로봇 이벤트 로그
+    _log_entries: deque = deque(maxlen=100)
+    _log_lock = threading.Lock()
+
+    @classmethod
+    def push_log(cls, level: str, msg: str):
+        ts = time.strftime('%H:%M:%S')
+        with cls._log_lock:
+            cls._log_entries.append({'t': ts, 'l': level, 'm': msg})
 
     @classmethod
     def load_places(cls):
@@ -80,6 +90,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self._slam_state_json()
         elif self.path == '/places':
             self._places_json()
+        elif self.path == '/log':
+            self._log_json()
         else:
             self._index()
 
@@ -200,6 +212,17 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _log_json(self):
+        with self._log_lock:
+            data = list(self._log_entries)
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(body)
+
     def _json_response(self, data: dict, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
@@ -240,6 +263,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.places_data = [p for p in self.places_data if p['name'] != name]
             self.places_data.append(place)
             self._save_places()
+        MJPEGHandler.push_log('PLACE', f'Indexed "{name}" at ({place["x"]}, {place["y"]})')
         self._json_response({'ok': True, 'place': place})
 
     def _delete_place(self):
@@ -338,6 +362,10 @@ class WebNode(Node):
         self.follow_sub = self.create_subscription(
             Bool, '/motherv2/follow_enabled', self.follow_callback, 1
         )
+        # MQTT 릴레이 명령 구독 → 로그용
+        self.relay_sub = self.create_subscription(
+            String, '/motherv2/relay_cmd', self._relay_callback, 1
+        )
 
         # ── 구독: SLAM ──────────────────────────────────────────────────────
         # slam_toolbox는 /map을 TRANSIENT_LOCAL(latching)로 퍼블리시함.
@@ -378,8 +406,15 @@ class WebNode(Node):
     # ── 기존 콜백 ─────────────────────────────────────────────────────────
 
     def follow_callback(self, msg: Bool):
+        val = bool(msg.data)
         with MJPEGHandler.status_lock:
-            MJPEGHandler.status_state['follow_enabled'] = bool(msg.data)
+            prev = MJPEGHandler.status_state.get('follow_enabled')
+            MJPEGHandler.status_state['follow_enabled'] = val
+        if prev != val:
+            MJPEGHandler.push_log('FOLLOW', f'Follow {"ON" if val else "OFF"}')
+
+    def _relay_callback(self, msg: String):
+        MJPEGHandler.push_log('MQTT', f'Relay → {msg.data.upper()}')
 
     def detection_callback(self, msg: DetectionArray):
         boxes = []
@@ -389,7 +424,11 @@ class WebNode(Node):
             self._det_boxes = boxes
             self._det_time = time.time()
         with MJPEGHandler.status_lock:
-            MJPEGHandler.status_state['detecting'] = len(boxes) > 0
+            prev = MJPEGHandler.status_state.get('detecting')
+            detecting = len(boxes) > 0
+            MJPEGHandler.status_state['detecting'] = detecting
+        if prev != detecting:
+            MJPEGHandler.push_log('DETECT', f'Object {"detected" if detecting else "lost"}')
 
     def motor_callback(self, msg: MotorCommand):
         ls, ld = msg.left_speed, msg.left_dir
@@ -408,7 +447,10 @@ class WebNode(Node):
             state = 'ARC'
         data = {'left_speed': ls, 'left_dir': ld, 'right_speed': rs, 'right_dir': rd, 'state': state}
         with MJPEGHandler.motor_lock:
+            prev_state = MJPEGHandler.motor_state.get('state')
             MJPEGHandler.motor_state = data
+        if prev_state != state:
+            MJPEGHandler.push_log('MOTOR', f'Motor → {state}')
 
     def camera_callback(self, msg: Image):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -446,7 +488,10 @@ class WebNode(Node):
 
     def _map_callback(self, msg: OccupancyGrid):
         with self._map_lock:
+            first = self._occupancy_grid is None
             self._occupancy_grid = msg
+        if first:
+            MJPEGHandler.push_log('SLAM', f'Map received ({msg.info.width}x{msg.info.height}, res={msg.info.resolution:.2f}m)')
 
     def _scan_callback(self, msg: LaserScan):
         """LiDAR 스캔 → 로봇 기준 XY 포인트로 변환 (180포인트로 다운샘플)."""
@@ -671,6 +716,18 @@ canvas{display:block;margin:0 auto;border-radius:6px}
 #place-list .pi .pname{color:#aa66ff}
 #place-list .pi .pdel{color:#555;cursor:pointer;padding:0 4px}
 #place-list .pi .pdel:hover{color:#f66}
+#log-box{width:320px;height:460px;overflow-y:auto;text-align:left;font-size:.7em;line-height:1.5;scroll-behavior:smooth}
+#log-box .le{display:flex;gap:6px;padding:2px 0;border-bottom:1px solid #1e1e1e}
+#log-box .lt{color:#555;flex-shrink:0;width:56px}
+#log-box .ll{flex-shrink:0;width:50px;font-weight:bold;text-align:center;border-radius:3px;padding:0 2px}
+#log-box .lm{color:#ccc;word-break:break-all}
+.ll-FOLLOW{color:#00ccff}
+.ll-MQTT{color:#cc88ff}
+.ll-MOTOR{color:#ffcc00}
+.ll-DETECT{color:#ff8800}
+.ll-SLAM{color:#00ff88}
+.ll-PLACE{color:#aa66ff}
+.ll-INFO{color:#aaa}
 </style>
 </head>
 <body>
@@ -710,6 +767,12 @@ canvas{display:block;margin:0 auto;border-radius:6px}
   <button onclick="saveMap()" id="btn-savemap">💾 맵 저장</button>
 </div>
 <div id="place-list"></div>
+</div>
+
+<!-- 로봇 로그 -->
+<div class="panel">
+<h2>Robot Log</h2>
+<div id="log-box"></div>
 </div>
 
 </div>
@@ -850,6 +913,19 @@ function renderSlam(){
     var ox=(sW-mi.img_w*s)/2,oy=(sH-mi.img_h*s)/2;
     sctx.drawImage(mapImg,ox,oy,mi.img_w*s,mi.img_h*s);
 
+    // 라이다 스캔 포인트 (로봇 기준 → 맵 좌표 변환)
+    if(d.scan&&d.scan.length>0&&d.robot&&d.robot.valid){
+      var rx=d.robot.x,ry=d.robot.y,ryaw=d.robot.yaw;
+      var cosY=Math.cos(ryaw),sinY=Math.sin(ryaw);
+      sctx.fillStyle="rgba(0,220,80,0.7)";
+      for(var i=0;i<d.scan.length;i++){
+        var sx=d.scan[i][0],sy=d.scan[i][1];
+        var mx=rx+sx*cosY-sy*sinY,my2=ry+sx*sinY+sy*cosY;
+        var cp=m2c(mx,my2,mi,ox,oy,s);
+        sctx.fillRect(cp.x-1.5,cp.y-1.5,3,3);
+      }
+    }
+
     // 궤적
     if(d.trajectory&&d.trajectory.length>1){
       sctx.strokeStyle="rgba(255,100,200,0.4)";sctx.lineWidth=2;sctx.beginPath();
@@ -983,6 +1059,29 @@ function renderSlam(){
   sInfo.innerHTML=info;
 }
 setInterval(renderSlam,200);
+
+// ── 로봇 로그 ────────────────────────────────────────────────────────────
+var logBox=document.getElementById("log-box");
+var logLen=0;
+var logColors={FOLLOW:"#00ccff",MQTT:"#cc88ff",MOTOR:"#ffcc00",DETECT:"#ff8800",SLAM:"#00ff88",PLACE:"#aa66ff",INFO:"#aaa"};
+function fetchLog(){
+  fetch("/log").then(function(r){return r.ok?r.json():null;}).then(function(entries){
+    if(!entries||entries.length===logLen)return;
+    logLen=entries.length;
+    var html="";
+    for(var i=0;i<entries.length;i++){
+      var e=entries[i];
+      var col=logColors[e.l]||"#aaa";
+      html+="<div class='le'>"+
+            "<span class='lt'>"+e.t+"</span>"+
+            "<span class='ll ll-"+e.l+"' style='color:"+col+"'>"+e.l+"</span>"+
+            "<span class='lm'>"+e.m+"</span></div>";
+    }
+    logBox.innerHTML=html;
+    logBox.scrollTop=logBox.scrollHeight;
+  }).catch(function(){});
+}
+setInterval(fetchLog,1000);fetchLog();
 
 // ── 장소 인덱싱 기능 ──────────────────────────────────────────────────────
 function renderPlaceList(places){
