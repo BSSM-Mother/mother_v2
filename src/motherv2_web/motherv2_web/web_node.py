@@ -336,14 +336,14 @@ class WebNode(Node):
         )
 
         # ── 구독: SLAM ──────────────────────────────────────────────────────
-        # slam_toolbox 버전에 따라 /map QoS가 TRANSIENT_LOCAL 또는 VOLATILE
-        # VOLATILE 구독은 두 경우 모두 호환됨 (TRANSIENT_LOCAL과 달리 강제 요구 없음)
-        # slam_toolbox가 1Hz로 주기 퍼블리시하므로 latching 불필요
+        # slam_toolbox는 /map을 TRANSIENT_LOCAL(latching)로 퍼블리시함.
+        # 구독자도 TRANSIENT_LOCAL이어야 연결되며, 노드 시작 전에 이미
+        # 발행된 맵도 즉시 수신할 수 있음.
         map_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
-            durability=QoSDurabilityPolicy.VOLATILE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self._map_callback, map_qos)
