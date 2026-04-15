@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 import os
@@ -312,6 +313,9 @@ class WebNode(Node):
         self._scan_lock = threading.Lock()
         self._scan_points = []              # list of [x, y] (robot-relative, downsampled)
 
+        # ── 맵 b64 전송 주기 카운터 ─────────────────────────────────────────
+        self._slam_state_tick = 0
+
         # ── TF2 ────────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -601,8 +605,18 @@ class WebNode(Node):
         traj = list(self._slam_trajectory)
         map_info = getattr(self, '_map_render_info', {'available': False})
 
+        # 맵 이미지를 2초마다 (10틱) base64로 포함 — 별도 /slam_map 요청 불필요
+        self._slam_state_tick += 1
+        map_b64 = None
+        if self._slam_state_tick % 10 == 1:  # 첫 틱 포함하여 10틱마다 전송
+            with MJPEGHandler.slam_map_lock:
+                jpeg_data = MJPEGHandler.slam_map_jpeg
+            if jpeg_data is not None:
+                map_b64 = base64.b64encode(jpeg_data).decode('ascii')
+
         state = {
             'map_info': map_info,
+            'map_b64': map_b64,
             'robot': {
                 'x': round(rp[0], 3) if rp else 0,
                 'y': round(rp[1], 3) if rp else 0,
@@ -768,24 +782,26 @@ var sc2=document.getElementById("slam-canvas"),sctx=sc2.getContext("2d");
 var sW=sc2.width,sH=sc2.height;
 var sInfo=document.getElementById("slam-info");
 var mapImg=new Image();
-var mapLoaded=false;
 var SD=null;  // 최신 slam_state 데이터 캐시
 
-// ── 데이터 fetch (렌더링과 분리) ─────────────────────────────────────────
+// ── 데이터 fetch + 맵 이미지 갱신 ────────────────────────────────────────
+// slam_state JSON에 map_b64 필드가 있을 때만 맵 이미지를 갱신 (2초 주기)
+// 별도의 /slam_map 이미지 요청 없이 단일 JSON fetch로 처리
 function fetchSD(){
   fetch("/slam_state")
     .then(function(r){return r.ok?r.json():null;})
-    .then(function(d){if(d)SD=d;})
+    .then(function(d){
+      if(!d)return;
+      SD=d;
+      if(d.map_b64){
+        var img=new Image();
+        img.onload=function(){mapImg=img;};
+        img.src="data:image/jpeg;base64,"+d.map_b64;
+      }
+    })
     .catch(function(){});
 }
 setInterval(fetchSD,200);fetchSD();
-
-function loadMap(){
-  var img=new Image();
-  img.onload=function(){mapImg=img;mapLoaded=true;};
-  img.src="/slam_map?t="+Date.now();
-}
-setInterval(loadMap,2000);loadMap();
 
 // ── 좌표 변환 헬퍼 ───────────────────────────────────────────────────────
 function m2c(mx,my,mi,ox,oy,s){
