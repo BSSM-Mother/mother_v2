@@ -37,10 +37,13 @@ import rclpy
 import rclpy.duration
 import rclpy.time
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import (
+    QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy,
+)
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from tf2_ros import (
     Buffer, TransformListener,
     LookupException, ConnectivityException, ExtrapolationException,
@@ -274,8 +277,15 @@ class SlamLocalizationNode(Node):
         self._last_known_map_x: float | None = None
         self._last_known_map_y: float | None = None
         self._last_known_depth: float | None = None
-        self._last_known_angle: float | None = None
+        self._last_known_angle: float | None = None  # 마지막 카메라 기준 방위각 (로봇 프레임)
         self._last_known_pub_time: float = 0.0  # last_known 퍼블리시 rate limit
+
+        # 객체가 카메라 가장자리에서 나갔는지 여부
+        # True  → 화면 끝에서 이탈, 즉시 LiDAR 추적 전환 필요
+        # False → 화면 중앙 소실, 가림 가능성으로 lost_timeout 대기
+        self._exited_from_edge: bool = False
+        # 가장자리 판정 기준: 화면 좌우 10% 이내
+        self._edge_threshold: float = 0.10
 
         # ── 장소 인덱스 ────────────────────────────────────────────────────
         idx_path = self.get_parameter('location_index_path').value
@@ -289,11 +299,24 @@ class SlamLocalizationNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # ── SLAM 모드 / 정적 맵 ──────────────────────────────────────────────
+        # 'mapping'  : 궤적 기반 추적 (기존 방식)
+        # 'tracking' : 정적 맵 change detection (맵 고정 후 동적 객체 탐지)
+        self._slam_mode: str = 'mapping'
+        self._latest_map: OccupancyGrid | None = None   # slam_toolbox에서 수신하는 최신 맵
+        self._frozen_map: OccupancyGrid | None = None   # tracking 모드 진입 시 스냅샷
+
         # ── QoS ────────────────────────────────────────────────────────────
         scan_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
+        )
+        map_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
 
         # ── 구독 ────────────────────────────────────────────────────────────
@@ -302,6 +325,10 @@ class SlamLocalizationNode(Node):
         self.det_sub = self.create_subscription(
             DetectionArray, '/motherv2/detections',
             self._detections_callback, 1)
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, '/map', self._map_callback, map_qos)
+        self.mode_sub = self.create_subscription(
+            String, '/motherv2/slam_mode', self._mode_callback, 1)
 
         # ── 퍼블리셔 ────────────────────────────────────────────────────────
         self.estimates_pub = self.create_publisher(
@@ -337,6 +364,29 @@ class SlamLocalizationNode(Node):
     def _scan_callback(self, msg: LaserScan):
         self._latest_scan = msg
 
+    def _map_callback(self, msg: OccupancyGrid):
+        self._latest_map = msg
+
+    def _mode_callback(self, msg: String):
+        new_mode = msg.data.strip().lower()
+        if new_mode == self._slam_mode:
+            return
+        if new_mode == 'tracking':
+            if self._latest_map is None:
+                self.get_logger().warn('[Mode] 맵이 아직 없어 tracking 모드 전환 불가')
+                return
+            self._frozen_map = self._latest_map
+            self._slam_mode = 'tracking'
+            w, h = self._frozen_map.info.width, self._frozen_map.info.height
+            self.get_logger().info(
+                f'[Mode] → tracking (change detection 활성화, '
+                f'맵 {w}x{h} 스냅샷)'
+            )
+        elif new_mode == 'mapping':
+            self._frozen_map = None
+            self._slam_mode = 'mapping'
+            self.get_logger().info('[Mode] → mapping (궤적 기반 추적)')
+
     def _detections_callback(self, msg: DetectionArray):
         estimates: list[ObjectEstimate] = []
 
@@ -364,6 +414,16 @@ class SlamLocalizationNode(Node):
         if detected_target:
             self._last_detection_time = time.time()
             self._is_lost = False
+            # bbox 중심이 화면 가장자리 10% 이내면 이탈 예고
+            cx_norm = 0.5
+            for det in msg.detections:
+                if det.class_id == self.target_class:
+                    cx_norm = (det.x + det.w / 2.0) / self.image_width
+                    break
+            self._exited_from_edge = (
+                cx_norm < self._edge_threshold or
+                cx_norm > (1.0 - self._edge_threshold)
+            )
 
         if estimates:
             out = ObjectEstimateArray()
@@ -393,15 +453,14 @@ class SlamLocalizationNode(Node):
             )
 
         # ── 2단계: LiDAR 전용 추적 ───────────────────────────────────────
-        if self._last_known_map_x is not None:
-            result = self._lidar_only_estimate()
-            if result is not None:
-                depth, map_x, map_y, angle = result
-                self._publish_lidar_estimate(depth, map_x, map_y, angle)
-                return  # LiDAR 추적 성공 → prediction 불필요
-        else:
-            # _last_known이 없으면 카메라가 한 번도 물체를 못 본 것
-            return
+        if self._last_known_map_x is None:
+            return  # 카메라가 한 번도 물체를 못 본 것
+
+        result = self._lidar_only_estimate()
+        if result is not None:
+            depth, map_x, map_y, angle = result
+            self._publish_lidar_estimate(depth, map_x, map_y, angle)
+            return  # 추적 성공 → prediction 불필요
 
         # ── 3단계: 마지막 위치 유지 ──────────────────────────────────────
         now = time.time()
@@ -455,10 +514,6 @@ class SlamLocalizationNode(Node):
         if scan is None:
             return None
 
-        traj = self._trajectory.get(self.target_class)
-        if traj is None or not traj.has_data:
-            return None
-
         try:
             robot_tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame,
@@ -470,19 +525,27 @@ class SlamLocalizationNode(Node):
 
         rx = robot_tf.transform.translation.x
         ry = robot_tf.transform.translation.y
-        rqz = robot_tf.transform.rotation.z
-        rqw = robot_tf.transform.rotation.w
-        robot_yaw = 2.0 * math.atan2(rqz, rqw)
+        robot_yaw = 2.0 * math.atan2(
+            robot_tf.transform.rotation.z, robot_tf.transform.rotation.w)
 
-        # 로스트 경과 시간으로 예측 위치 계산
         elapsed = time.time() - self._last_detection_time
-        pred_x, pred_y = traj.predict(elapsed)
-        if pred_x is None:
-            pred_x, pred_y = traj.last_position()
+        traj = self._trajectory.get(self.target_class)
+        pred_x, pred_y = None, None
+        if traj and traj.has_data:
+            pred_x, pred_y = traj.predict(elapsed)
+            if pred_x is None:
+                pred_x, pred_y = traj.last_position()
+
+        # ── tracking 모드: 맵 change detection ────────────────────────────
+        if self._slam_mode == 'tracking' and self._frozen_map is not None:
+            result = self._change_detect_estimate(
+                scan, robot_tf, pred_x, pred_y, rx, ry)
+            return result
+
+        # ── mapping 모드: 궤적 방향 LiDAR 스캔 ───────────────────────────
         if pred_x is None:
             return None
 
-        # 예측 위치 → 로봇 기준 방위각
         dx = pred_x - rx
         dy = pred_y - ry
         world_angle = math.atan2(dy, dx)
@@ -495,7 +558,8 @@ class SlamLocalizationNode(Node):
         raw_depth = self._measure_depth(search_angle, sector)
         if raw_depth <= 0.0:
             self.get_logger().debug(
-                f'[LiDAR] 방향({math.degrees(search_angle):.0f}°) ±{math.degrees(sector):.0f}° 스캔 없음'
+                f'[LiDAR] 방향({math.degrees(search_angle):.0f}°)'
+                f' ±{math.degrees(sector):.0f}° 스캔 없음'
             )
             return None
 
@@ -509,6 +573,116 @@ class SlamLocalizationNode(Node):
             return None
 
         return raw_depth, map_x, map_y, search_angle
+
+    # ── Change Detection (tracking 모드) ──────────────────────────────────
+
+    def _find_dynamic_points(self, scan: LaserScan, robot_tf) -> list:
+        """
+        현재 LiDAR 스캔에서 정적 맵의 FREE 셀에 찍힌 점 추출.
+        맵에 없던 물체(동적 장애물 = 사람)만 남는다.
+
+        Returns: [(map_x, map_y, range, beam_angle), ...]
+        """
+        grid = self._frozen_map
+        if grid is None:
+            return []
+
+        res = grid.info.resolution
+        ox = grid.info.origin.position.x
+        oy = grid.info.origin.position.y
+        gw = grid.info.width
+        gh = grid.info.height
+
+        rx = robot_tf.transform.translation.x
+        ry = robot_tf.transform.translation.y
+        yaw = 2.0 * math.atan2(
+            robot_tf.transform.rotation.z,
+            robot_tf.transform.rotation.w,
+        )
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+
+        dynamic = []
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min <= r <= scan.range_max
+                    and self.min_depth <= r <= self.max_depth):
+                continue
+            beam_angle = scan.angle_min + i * scan.angle_increment
+            lx = r * math.cos(beam_angle)
+            ly = r * math.sin(beam_angle)
+
+            # 맵 프레임 변환
+            mx = rx + cos_y * lx - sin_y * ly
+            my = ry + sin_y * lx + cos_y * ly
+
+            # 그리드 셀 인덱스
+            cx = int((mx - ox) / res)
+            cy = int((my - oy) / res)
+            if not (0 <= cx < gw and 0 <= cy < gh):
+                continue
+
+            # FREE(0)인 셀에 포인트 → 동적 물체
+            if grid.data[cy * gw + cx] == 0:
+                dynamic.append((mx, my, r, beam_angle))
+
+        return dynamic
+
+    def _cluster_points(self, pts: list, radius: float = 0.4) -> list:
+        """
+        거리 기반 단순 클러스터링.
+        Returns: [(cx, cy, avg_range, avg_angle, point_count), ...]
+        """
+        if not pts:
+            return []
+        used = [False] * len(pts)
+        clusters = []
+        for i, pt in enumerate(pts):
+            if used[i]:
+                continue
+            cluster = [pt]
+            used[i] = True
+            for j in range(i + 1, len(pts)):
+                if used[j]:
+                    continue
+                if math.hypot(pt[0] - pts[j][0], pt[1] - pts[j][1]) <= radius:
+                    cluster.append(pts[j])
+                    used[j] = True
+            cx = sum(p[0] for p in cluster) / len(cluster)
+            cy = sum(p[1] for p in cluster) / len(cluster)
+            ar = sum(p[2] for p in cluster) / len(cluster)
+            aa = sum(p[3] for p in cluster) / len(cluster)
+            clusters.append((cx, cy, ar, aa, len(cluster)))
+        return clusters
+
+    def _change_detect_estimate(self, scan: LaserScan, robot_tf,
+                                pred_x: float | None,
+                                pred_y: float | None,
+                                rx: float, ry: float):
+        """
+        Change detection으로 동적 물체 위치 추정.
+        가장 큰 클러스터 중 예측 위치에 가장 가까운 것을 반환.
+        Returns (depth, map_x, map_y, angle) or None.
+        """
+        dynamic = self._find_dynamic_points(scan, robot_tf)
+        clusters = self._cluster_points(dynamic)
+        if not clusters:
+            return None
+
+        # 최소 3포인트 이상 클러스터만 유효
+        valid = [c for c in clusters if c[4] >= 3]
+        if not valid:
+            return None
+
+        # 예측 위치 또는 마지막 위치 기준으로 가장 가까운 클러스터
+        ref_x = pred_x if pred_x is not None else rx
+        ref_y = pred_y if pred_y is not None else ry
+        best = min(valid, key=lambda c: math.hypot(c[0] - ref_x, c[1] - ref_y))
+
+        cx, cy, avg_r, avg_a, count = best
+        self.get_logger().info(
+            f'[ChangeDetect] 클러스터: ({cx:.2f},{cy:.2f}) '
+            f'{count}pts {avg_r:.2f}m @ {math.degrees(avg_a):.0f}°'
+        )
+        return avg_r, cx, cy, avg_a
 
     def _publish_lidar_estimate(self, depth: float, map_x: float, map_y: float,
                                 angle: float):

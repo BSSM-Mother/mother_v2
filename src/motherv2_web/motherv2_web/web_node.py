@@ -39,6 +39,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     slam_state = {}            # JSON-serializable dict
     slam_state_lock = threading.Lock()
 
+    # WebNode 인스턴스 참조 (HTTP 핸들러 → ROS 퍼블리시용)
+    _node_ref = None
+    _node_ref_lock = threading.Lock()
+
     # 장소 인덱스
     _places_file = os.path.expanduser('~/.ros/motherv2/places.json')
     places_data: list = []
@@ -102,6 +106,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self._delete_place()
         elif self.path == '/save_map':
             self._save_map_handler()
+        elif self.path == '/set_mode':
+            self._set_mode_handler()
+        elif self.path == '/load_map':
+            self._load_map_handler()
         else:
             self.send_error(404)
 
@@ -300,6 +308,45 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json_response({'ok': False, 'error': str(e)}, 500)
 
+    def _set_mode_handler(self):
+        """SLAM 모드 전환 (mapping ↔ tracking)."""
+        try:
+            data = self._read_json_body()
+            mode = str(data.get('mode', '')).strip().lower()
+        except Exception:
+            self._json_response({'ok': False, 'error': 'bad json'}, 400)
+            return
+        if mode not in ('mapping', 'tracking'):
+            self._json_response({'ok': False, 'error': 'mode must be mapping or tracking'}, 400)
+            return
+        with self.__class__._node_ref_lock:
+            node = self.__class__._node_ref
+        if node is None:
+            self._json_response({'ok': False, 'error': 'node not ready'}, 503)
+            return
+        node.publish_slam_mode(mode)
+        MJPEGHandler.push_log('SLAM', f'Mode → {mode.upper()}')
+        self._json_response({'ok': True, 'mode': mode})
+
+    def _load_map_handler(self):
+        """저장된 맵 불러오기 (slam_toolbox/deserialize_map 서비스 호출)."""
+        map_path = os.path.expanduser('~/maps/slam_map')
+        try:
+            result = subprocess.run(
+                ['ros2', 'service', 'call',
+                 '/slam_toolbox/deserialize_map',
+                 'slam_toolbox/srv/DeserializePoseGraph',
+                 f'{{filename: "{map_path}", match_type: 1}}'],
+                capture_output=True, text=True, timeout=20,
+            )
+            ok = result.returncode == 0
+            msg = (result.stdout if ok else result.stderr)[:300]
+            if ok:
+                MJPEGHandler.push_log('SLAM', f'Map loaded: {map_path}')
+            self._json_response({'ok': ok, 'path': map_path, 'msg': msg})
+        except Exception as e:
+            self._json_response({'ok': False, 'error': str(e)}, 500)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 메인 노드
@@ -395,6 +442,14 @@ class WebNode(Node):
         self.create_timer(0.2, self._update_slam_state)
         # 로봇 포즈 TF 조회 (10Hz)
         self.create_timer(0.1, self._update_robot_pose)
+
+        # ── SLAM 모드 퍼블리셔 ────────────────────────────────────────────
+        self._slam_mode_pub = self.create_publisher(
+            String, '/motherv2/slam_mode', 1)
+
+        # HTTP 핸들러에서 ROS 퍼블리시할 수 있도록 node 참조 등록
+        with MJPEGHandler._node_ref_lock:
+            MJPEGHandler._node_ref = self
 
         # ── HTTP 서버 ──────────────────────────────────────────────────────
         MJPEGHandler.load_places()
@@ -677,7 +732,14 @@ class WebNode(Node):
         with MJPEGHandler.slam_state_lock:
             MJPEGHandler.slam_state = state
 
+    def publish_slam_mode(self, mode: str):
+        msg = String()
+        msg.data = mode
+        self._slam_mode_pub.publish(msg)
+
     def destroy_node(self):
+        with MJPEGHandler._node_ref_lock:
+            MJPEGHandler._node_ref = None
         self.server.shutdown()
         # TF2 리스너 스레드를 먼저 정리해야 SIGINT 시 SIGABRT 방지
         self.tf_listener = None
@@ -765,6 +827,12 @@ canvas{display:block;margin:0 auto;border-radius:6px}
   <input id="place-name" type="text" placeholder="장소 이름 (예: 거실)" maxlength="20">
   <button onclick="addPlace()">📍 인덱싱</button>
   <button onclick="saveMap()" id="btn-savemap">💾 맵 저장</button>
+  <button onclick="loadMap()" id="btn-loadmap">📂 맵 불러오기</button>
+</div>
+<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;justify-content:center">
+  <span id="mode-badge" style="font-size:.7em;padding:3px 10px;border-radius:12px;background:#1e3a1e;color:#0f0;border:1px solid #2a5a2a">MAPPING</span>
+  <button onclick="setMode('tracking')" id="btn-tracking" style="background:#1a2a3a;border:1px solid #2a4a6a;color:#4af;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">🔍 추적 모드</button>
+  <button onclick="setMode('mapping')" id="btn-mapping" style="background:#1e3a1e;border:1px solid #2a5a2a;color:#0f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75em">🗺 매핑 모드</button>
 </div>
 <div id="place-list"></div>
 </div>
@@ -1132,6 +1200,41 @@ function saveMap(){
       if(d.ok)alert("맵 저장 완료\\n경로: "+d.path);
       else alert("맵 저장 실패\\n"+d.error);
     }).catch(function(){btn.textContent="💾 맵 저장";btn.disabled=false;alert("서버 오류");});
+}
+
+function loadMap(){
+  if(!confirm("저장된 맵을 불러옵니다.\\n현재 맵은 덮어씌워집니다. 계속할까요?"))return;
+  var btn=document.getElementById("btn-loadmap");
+  btn.textContent="불러오는 중...";btn.disabled=true;
+  fetch("/load_map",{method:"POST"})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      btn.textContent="📂 맵 불러오기";btn.disabled=false;
+      if(d.ok)alert("맵 불러오기 완료\\n경로: "+d.path);
+      else alert("맵 불러오기 실패\\n"+(d.error||d.msg));
+    }).catch(function(){btn.textContent="📂 맵 불러오기";btn.disabled=false;alert("서버 오류");});
+}
+
+var curMode="mapping";
+function setMode(mode){
+  fetch("/set_mode",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({mode:mode})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        curMode=mode;
+        var badge=document.getElementById("mode-badge");
+        if(mode==="tracking"){
+          badge.textContent="TRACKING";
+          badge.style.background="#1a2a3a";badge.style.color="#4af";badge.style.borderColor="#2a4a6a";
+        } else {
+          badge.textContent="MAPPING";
+          badge.style.background="#1e3a1e";badge.style.color="#0f0";badge.style.borderColor="#2a5a2a";
+        }
+      } else {
+        alert("모드 전환 실패: "+(d.error||""));
+      }
+    }).catch(function(){alert("서버 오류");});
 }
 </script>
 </body>
