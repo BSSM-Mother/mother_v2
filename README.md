@@ -1,6 +1,6 @@
 # MotherV2 — Object Following Robot
 
-Raspberry Pi 5 + ROS2 Jazzy 기반의 자율 추적 로봇.  
+Raspberry Pi 4B + ROS2 Jazzy 기반의 자율 추적 로봇.  
 LiDAR + 카메라로 대상(기본: 사람)을 인식·추적하며, SLAM 맵 기반 동적 객체 탐지 및 자율 탐색을 지원한다.
 
 ---
